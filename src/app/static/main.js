@@ -2223,6 +2223,15 @@ window.handleSearch = (searchTerm) => {
     case 'grn':
       filterGRNs(term);
       break;
+    case 'customer_cards':
+      filterCustomerCards(term);
+      break;
+    case 'eft_payments':
+      filterEFTPayments(term);
+      break;
+    case 'dhofar_recon':
+      filterDhofarRecon(term);
+      break;
   }
 };
 
@@ -2310,7 +2319,7 @@ window.triggerNav = (type) => {
   currentView = type;
   
   // Show/hide search bar based on view type
-  const searchableViews = ['recon', 'invoice', 'po', 'grn'];
+  const searchableViews = ['recon', 'invoice', 'po', 'grn', 'customer_cards', 'eft_payments', 'dhofar_recon'];
   const searchBar = document.getElementById('search-bar');
   const searchInput = document.getElementById('search-input');
   
@@ -2321,7 +2330,10 @@ window.triggerNav = (type) => {
       'recon': 'Search by PO number or vendor...',
       'invoice': 'Search by invoice number, PO, or vendor...',
       'po': 'Search by PO number, vendor, or buyer...',
-      'grn': 'Search by GRN number, PO, or vendor...'
+      'grn': 'Search by GRN number, PO, or vendor...',
+      'customer_cards': 'Search by customer name or ID...',
+      'eft_payments': 'Search by reference or date...',
+      'dhofar_recon': 'Search by remitter or customer name...',
     };
     searchInput.placeholder = placeholders[type] || 'Search...';
   } else {
@@ -2339,6 +2351,9 @@ window.triggerNav = (type) => {
   if (type === 'invoice') renderInvoices();
   if (type === 'vendors') renderVendors();
   if (type === 'buyers') renderBuyers();
+  if (type === 'customer_cards') renderCustomerCards();
+  if (type === 'eft_payments') renderEFTPayments();
+  if (type === 'dhofar_recon') renderDhofarReconciliation();
 };
 
 // Initialize app
@@ -2351,11 +2366,28 @@ window.addEventListener("DOMContentLoaded", async () => {
 // --- Upload Modal Handlers ---
 
 let selectedFiles = [];
+let uploadContext = null; // 'customer_card' | 'eft' | null (auto-detect)
 
-window.openUploadModal = () => {
+window.openUploadModal = (context) => {
+  uploadContext = context || null;
   const modal = document.getElementById('upload-modal');
   modal.classList.remove('hidden');
   resetUploadModal();
+
+  // Update modal hint based on context
+  const hint = document.getElementById('upload-hint');
+  if (hint) {
+    if (context === 'customer_card') {
+      hint.textContent = 'Upload a Customer Card PDF. It will be processed as a customer account statement.';
+      document.getElementById('file-input').accept = '.pdf';
+    } else if (context === 'eft') {
+      hint.textContent = 'Upload an EFT Excel file (.xlsx). Payment rows will be extracted automatically.';
+      document.getElementById('file-input').accept = '.xlsx,.xls';
+    } else {
+      hint.textContent = 'Upload a PDF (Invoice, PO, GRN, Customer Card) or Excel (EFT). The system auto-classifies.';
+      document.getElementById('file-input').accept = '.pdf,.xlsx,.xls';
+    }
+  }
 };
 
 window.closeUploadModal = () => {
@@ -2387,8 +2419,10 @@ function displaySelectedFiles(files) {
   const errors = [];
   
   files.forEach(file => {
-    if (!file.name.endsWith('.pdf')) {
-      errors.push(`${file.name}: Not a PDF file`);
+    const isPdf = file.name.toLowerCase().endsWith('.pdf');
+    const isExcel = file.name.toLowerCase().endsWith('.xlsx') || file.name.toLowerCase().endsWith('.xls');
+    if (!isPdf && !isExcel) {
+      errors.push(`${file.name}: Not a PDF or Excel file`);
     } else if (file.size > 10 * 1024 * 1024) {
       errors.push(`${file.name}: File size exceeds 10MB`);
     } else {
@@ -2505,7 +2539,18 @@ window.uploadFile = async () => {
       const formData = new FormData();
       formData.append('file', file);
       
-      const response = await fetch('/api/upload', {
+      // Route to correct endpoint based on context or file type
+      const isExcel = file.name.toLowerCase().endsWith('.xlsx') || file.name.toLowerCase().endsWith('.xls');
+      let endpoint;
+      if (uploadContext === 'customer_card' || uploadContext === 'eft') {
+        endpoint = '/api/upload_dhofar';
+      } else if (isExcel) {
+        endpoint = '/api/upload_dhofar';
+      } else {
+        endpoint = '/api/upload';
+      }
+      
+      const response = await fetch(endpoint, {
         method: 'POST',
         body: formData
       });
@@ -2583,31 +2628,31 @@ window.uploadFile = async () => {
   `;
   document.getElementById('upload-result').classList.remove('hidden');
   
-  // Navigate to reconciliation and open the first successfully uploaded PO
+  // Navigate after upload based on context
   if (successCount > 0) {
     setTimeout(() => {
       closeUploadModal();
       
-      // Find the first successfully uploaded PO
-      const firstSuccessfulPO = results.find(r => 
-        r.success && 
-        r.result.document_type === 'purchase_order' && 
-        r.result.document_id
-      );
-      
-      if (firstSuccessfulPO) {
-        // Navigate to reconciliation and open this PO
-        triggerNav('recon');
-        // Wait a bit for data to load, then open the specific PO
-        setTimeout(() => {
-          renderRecon(firstSuccessfulPO.result.document_id);
-        }, 500);
+      if (uploadContext === 'customer_card') {
+        // Refresh customer cards view and auto-run reconciliation
+        triggerNav('customer_cards');
+        triggerDhofarRecon();
+      } else if (uploadContext === 'eft') {
+        triggerNav('eft_payments');
+        triggerDhofarRecon();
       } else {
-        // If no PO was uploaded, just refresh current view
-        const activeNav = document.querySelector('.nav-item.active');
-        if (activeNav) {
-          const navType = activeNav.id.replace('nav-', '');
-          triggerNav(navType);
+        // Default: navigate to reconciliation for PO uploads
+        const firstSuccessfulPO = results.find(r =>
+          r.success &&
+          r.result.document_type === 'purchase_order' &&
+          r.result.document_id
+        );
+        if (firstSuccessfulPO) {
+          triggerNav('recon');
+          setTimeout(() => renderRecon(firstSuccessfulPO.result.document_id), 500);
+        } else {
+          const activeNav = document.querySelector('.nav-item.active');
+          if (activeNav) triggerNav(activeNav.id.replace('nav-', ''));
         }
       }
     }, 2000);
@@ -2646,4 +2691,672 @@ function setupDropZone() {
       displaySelectedFiles(files);
     }
   });
+}
+
+
+// ============================================================
+// DHOFAR VIEWS
+// ============================================================
+
+// --- Customer Cards View ---
+async function renderCustomerCards() {
+  updateHeader("Customer Cards", "...");
+  document.getElementById('search-bar').classList.remove('hidden');
+  renderEmptyState("list-content", "Loading customer cards...");
+
+  // Show upload button in analytics bar
+  const bar = document.getElementById('analytics-bar');
+  bar.classList.remove('hidden');
+  bar.innerHTML = `
+    <div class="flex items-center justify-between w-full">
+      <span class="text-xs text-gray-500">Customer account statements from Dhofar Global</span>
+      <button onclick="openUploadModal('customer_card')"
+        class="inline-flex items-center gap-2 px-3 py-1.5 bg-amber-600 hover:bg-amber-700 text-white rounded-lg text-xs font-semibold transition-all shadow-sm">
+        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"></path>
+        </svg>
+        Upload Customer Card
+      </button>
+    </div>
+  `;
+
+  const data = await fetchJSON("/api/customer_cards");
+  updateHeader("Customer Cards", data.length);
+  window.customerCardsData = data;
+
+  if (!data.length) return renderEmptyState("list-content", `
+    <div class="p-6 text-center">
+      <p class="text-sm text-gray-500 mb-4">No customer cards found.</p>
+      <button onclick="openUploadModal('customer_card')" class="px-4 py-2 bg-amber-600 hover:bg-amber-700 text-white rounded-lg text-sm font-semibold">
+        Upload Customer Card
+      </button>
+    </div>`);
+  renderCustomerCardsList(data);
+}
+
+function renderCustomerCardsList(data) {
+  const listContent = document.getElementById("list-content");
+  listContent.innerHTML = data.map((d, idx) => {
+    const card = d.customer_card || {};
+    const name = card.customer_name || "Unknown";
+    const initial = name.charAt(0).toUpperCase();
+    const rows = card.statement_rows || [];
+    const totalBal = card.total_balance;
+
+    return `
+      <div class="list-item group p-4 border-b border-gray-100 hover:bg-gray-50 cursor-pointer border-l-4 border-l-transparent transition-all duration-200" data-index="${idx}">
+        <div class="flex items-center gap-3 mb-2">
+          <div class="w-9 h-9 rounded-lg bg-gradient-to-br from-amber-500 to-orange-600 flex items-center justify-center text-white font-bold text-sm flex-shrink-0">${initial}</div>
+          <div class="flex-1 min-w-0">
+            <div class="font-bold text-gray-900 group-hover:text-indigo-600 text-sm truncate">${name}</div>
+            <div class="text-[10px] text-gray-500">${card.customer_id || ''}</div>
+          </div>
+        </div>
+        <div class="flex justify-between text-[10px] text-gray-500">
+          <span>${rows.length} statement row${rows.length !== 1 ? 's' : ''}</span>
+          <span class="font-mono font-bold text-gray-700">${totalBal != null ? 'AED ' + totalBal.toLocaleString() : ''}</span>
+        </div>
+      </div>
+    `;
+  }).join("");
+
+  const rows = document.querySelectorAll(".list-item");
+  rows.forEach((row, idx) => row.addEventListener("click", () => selectCustomerCard(idx, data)));
+  if (data.length > 0) selectCustomerCard(0, data);
+}
+
+async function selectCustomerCard(idx, data) {
+  document.querySelectorAll(".list-item").forEach(r => r.classList.remove("active"));
+  const rows = document.querySelectorAll(".list-item");
+  if (rows[idx]) rows[idx].classList.add("active");
+
+  const d = data[idx];
+  const card = d.customer_card || {};
+  const cardId = d._id;
+  const name = card.customer_name || "Unknown";
+  const initial = name.charAt(0).toUpperCase();
+  const addr = card.address || {};
+  const contact = card.contact || {};
+  const stmtRows = card.statement_rows || [];
+
+  // Fetch reconciled EFT rows for this card
+  let reconRows = [];
+  try {
+    reconRows = await fetchJSON(`/api/dhofar/reconciliation/card/${cardId}`);
+  } catch(e) { /* ignore */ }
+
+  const detailPanel = document.getElementById("detail-panel");
+
+  // Statement rows table
+  const stmtHtml = stmtRows.length > 0
+    ? buildTable(
+        [
+          { label: "Posting Date" },
+          { label: "Document No." },
+          { label: "LPO / Ref" },
+          { label: "Customer" },
+          { label: "Original Amt", align: "right" },
+          { label: "Remaining", align: "right" },
+          { label: "Running Total", align: "right" },
+        ],
+        stmtRows.map(r => `
+          <tr class="hover:bg-amber-50 transition-colors">
+            <td class="px-4 py-2.5 text-xs text-gray-700 font-mono">${r.posting_date || '-'}</td>
+            <td class="px-4 py-2.5 text-xs font-medium text-indigo-700">${r.document_no || '-'}</td>
+            <td class="px-4 py-2.5 text-xs text-gray-600 max-w-[120px] truncate" title="${r.lpo || ''}">${r.lpo || '-'}</td>
+            <td class="px-4 py-2.5 text-xs text-gray-600 max-w-[120px] truncate">${r.sell_to_customer_name || '-'}</td>
+            <td class="px-4 py-2.5 text-xs text-right font-mono ${(r.original_amount || 0) < 0 ? 'text-green-700' : 'text-gray-900'} font-bold">${r.original_amount != null ? r.original_amount.toLocaleString() : '-'}</td>
+            <td class="px-4 py-2.5 text-xs text-right font-mono text-gray-700">${r.remaining_amount != null ? r.remaining_amount.toLocaleString() : '-'}</td>
+            <td class="px-4 py-2.5 text-xs text-right font-mono font-bold text-gray-900">${r.running_total != null ? r.running_total.toLocaleString() : '-'}</td>
+          </tr>
+        `).join("")
+      )
+    : '<p class="text-sm text-gray-400 italic p-4">No statement rows extracted.</p>';
+
+  // Reconciled EFT rows table
+  const reconHtml = reconRows.length > 0
+    ? buildTable(
+        [
+          { label: "EFT Date" },
+          { label: "Remitter" },
+          { label: "EFT Amount", align: "right" },
+          { label: "Stmt Doc" },
+          { label: "Stmt Amount", align: "right" },
+          { label: "Score", align: "right" },
+          { label: "Status" },
+        ],
+        reconRows.map(r => {
+          const stmt = r.matched_stmt_row || {};
+          const stBadge = r.status === 'matched'
+            ? 'bg-green-100 text-green-700' : 'bg-amber-100 text-amber-700';
+          return `
+            <tr class="hover:bg-green-50 transition-colors">
+              <td class="px-4 py-2.5 text-xs font-mono text-gray-600">${r.transfer_date || '-'}</td>
+              <td class="px-4 py-2.5 text-xs font-medium text-gray-900 max-w-[140px] truncate" title="${r.remitter || ''}">${r.remitter || '-'}</td>
+              <td class="px-4 py-2.5 text-xs text-right font-mono font-bold text-gray-900">${r.amount != null ? r.amount.toLocaleString() : '-'}</td>
+              <td class="px-4 py-2.5 text-xs text-indigo-700 font-medium">${stmt.document_no || '-'}</td>
+              <td class="px-4 py-2.5 text-xs text-right font-mono text-gray-700">${stmt.original_amount != null ? stmt.original_amount.toLocaleString() : '-'}</td>
+              <td class="px-4 py-2.5 text-xs text-right font-mono font-bold">${r.total_score}</td>
+              <td class="px-4 py-2.5 text-xs">
+                <span class="px-2 py-0.5 rounded-full text-[10px] font-bold uppercase ${stBadge}">${r.status}</span>
+              </td>
+            </tr>
+          `;
+        }).join("")
+      )
+    : `<div class="p-6 text-center">
+         <p class="text-sm text-gray-400 italic mb-3">No EFT payments reconciled to this card yet.</p>
+         <button onclick="triggerDhofarRecon()" class="px-3 py-1.5 bg-amber-600 hover:bg-amber-700 text-white rounded text-xs font-semibold">Run Reconciliation</button>
+       </div>`;
+
+  detailPanel.innerHTML = `
+    <!-- Header -->
+    <div class="flex justify-between items-start mb-5">
+      <div class="flex items-start gap-4">
+        <div class="w-14 h-14 rounded-xl bg-gradient-to-br from-amber-500 to-orange-600 flex items-center justify-center text-white font-bold text-2xl shadow-lg">${initial}</div>
+        <div>
+          <h1 class="text-xl font-bold text-gray-900 mb-0.5">${name}</h1>
+          ${card.customer_id ? `<p class="text-xs text-gray-400 font-mono">ID: ${card.customer_id}</p>` : ''}
+          ${card.statement_date ? `<p class="text-xs text-gray-400">Statement: ${card.statement_date} · Period: ${card.starting_date || ''} – ${card.ending_date || ''}</p>` : ''}
+        </div>
+      </div>
+      <div class="flex items-center gap-3">
+        <div class="text-right">
+          <div class="text-lg font-bold text-gray-900">AED ${card.total_balance != null ? card.total_balance.toLocaleString() : '-'}</div>
+          ${card.overdue_amount != null ? `<div class="text-xs text-red-600 font-semibold">Overdue: AED ${card.overdue_amount.toLocaleString()}</div>` : ''}
+        </div>
+        ${buildPDFButton(d.source_file_path)}
+      </div>
+    </div>
+
+    <!-- Info grid -->
+    ${buildMetaGrid([
+      { label: "Currency", value: card.currency || "-" },
+      { label: "Payment Terms", value: card.payment_terms || "-" },
+      { label: "Account Manager", value: card.account_manager || "-" },
+      { label: "Statement #", value: card.statement_number || "-" },
+    ])}
+
+    ${addr && Object.values(addr).some(v => v) ? `
+      <div class="bg-amber-50 border border-amber-200 rounded-lg p-3 mb-5 text-xs text-amber-800">
+        📍 ${[addr.street, addr.city, addr.country].filter(Boolean).join(', ')}
+      </div>
+    ` : ''}
+
+    <!-- Tabs -->
+    <div class="border-b border-gray-200 mb-4">
+      <div class="flex gap-0">
+        <button onclick="switchCardTab('stmt-${cardId}', 'recon-${cardId}', this)" 
+          class="card-tab-btn px-5 py-2.5 text-xs font-bold border-b-2 border-indigo-600 text-indigo-700 -mb-px">
+          Statement (${stmtRows.length} rows)
+        </button>
+        <button onclick="switchCardTab('recon-${cardId}', 'stmt-${cardId}', this)"
+          class="card-tab-btn px-5 py-2.5 text-xs font-bold border-b-2 border-transparent text-gray-500 hover:text-gray-700 -mb-px">
+          Reconciliation (${reconRows.length} matched)
+        </button>
+      </div>
+    </div>
+
+    <!-- Statement tab -->
+    <div id="stmt-${cardId}">
+      <div class="flex justify-between items-center mb-3">
+        <h3 class="text-xs font-bold text-gray-500 uppercase tracking-wider">Account Statement</h3>
+        <span class="text-xs text-gray-400">${stmtRows.length} rows · Balance: AED ${card.total_balance != null ? card.total_balance.toLocaleString() : '-'}</span>
+      </div>
+      ${stmtHtml}
+    </div>
+
+    <!-- Reconciliation tab (hidden by default) -->
+    <div id="recon-${cardId}" class="hidden">
+      <div class="flex justify-between items-center mb-3">
+        <h3 class="text-xs font-bold text-gray-500 uppercase tracking-wider">EFT Payments Matched to This Card</h3>
+        <span class="text-xs text-gray-400">${reconRows.length} accepted · AED ${reconRows.reduce((s,r) => s + (r.amount||0), 0).toLocaleString()}</span>
+      </div>
+      ${reconHtml}
+    </div>
+  `;
+}
+
+window.switchCardTab = (showId, hideId, btn) => {
+  document.getElementById(showId).classList.remove('hidden');
+  document.getElementById(hideId).classList.add('hidden');
+  document.querySelectorAll('.card-tab-btn').forEach(b => {
+    b.classList.remove('border-indigo-600', 'text-indigo-700');
+    b.classList.add('border-transparent', 'text-gray-500');
+  });
+  btn.classList.remove('border-transparent', 'text-gray-500');
+  btn.classList.add('border-indigo-600', 'text-indigo-700');
+};
+
+function filterCustomerCards(term) {
+  if (!window.customerCardsData) return;
+  const filtered = term
+    ? window.customerCardsData.filter(d => {
+        const card = d.customer_card || {};
+        return (
+          (card.customer_name || '').toLowerCase().includes(term) ||
+          (card.customer_id || '').toLowerCase().includes(term) ||
+          (card.trade_name || '').toLowerCase().includes(term) ||
+          (card.industry || '').toLowerCase().includes(term)
+        );
+      })
+    : window.customerCardsData;
+  renderCustomerCardsList(filtered);
+}
+
+// --- EFT Payments View ---
+async function renderEFTPayments() {
+  updateHeader("EFT Payments", "...");
+  document.getElementById('search-bar').classList.remove('hidden');
+  renderEmptyState("list-content", "Loading EFT payments...");
+
+  const data = await fetchJSON("/api/eft_payments");
+  updateHeader("EFT Payments", data.length);
+  window.eftPaymentsData = data;
+
+  if (!data.length) return renderEmptyState("list-content", "No EFT payments found. Run ingest_dhofar.py to import.");
+
+  renderEFTPaymentsList(data);
+}
+
+function renderEFTPaymentsList(data) {
+  const listContent = document.getElementById("list-content");
+  listContent.innerHTML = data.map((d, idx) => {
+    const eft = d.eft_payment || {};
+    const ref = eft.eft_reference || d.source_filename || "Unknown";
+    const total = eft.total_amount;
+    const currency = eft.currency || "AED";
+    const itemCount = (eft.items || []).length;
+
+    return `
+      <div class="list-item group p-4 border-b border-gray-100 hover:bg-gray-50 cursor-pointer border-l-4 border-l-transparent transition-all duration-200" data-index="${idx}">
+        <div class="flex justify-between items-start mb-2">
+          <span class="font-bold text-gray-900 group-hover:text-indigo-600 text-sm truncate flex-1">${ref}</span>
+          ${total ? `<span class="text-xs font-mono font-bold text-gray-700 ml-2">${currency} ${total.toLocaleString()}</span>` : ''}
+        </div>
+        <div class="flex justify-between text-[10px] text-gray-500">
+          <span>${eft.payment_date || ''}</span>
+          <span>${itemCount} payment${itemCount !== 1 ? 's' : ''}</span>
+        </div>
+      </div>
+    `;
+  }).join("");
+
+  const rows = document.querySelectorAll(".list-item");
+  const select = (idx) => {
+    rows.forEach(r => r.classList.remove("active"));
+    rows[idx].classList.add("active");
+
+    const d = data[idx];
+    const eft = d.eft_payment || {};
+    const detailPanel = document.getElementById("detail-panel");
+    const currency = eft.currency || "AED";
+    const items = eft.items || [];
+
+    const itemsHtml = items.map(item => `
+      <tr>
+        <td class="px-4 py-3 text-xs font-medium text-gray-900">${item.beneficiary_name || '-'}</td>
+        <td class="px-4 py-3 text-xs text-gray-600">${item.bank_name || '-'}</td>
+        <td class="px-4 py-3 text-xs text-gray-500 max-w-xs truncate" title="${(item.description || item.remarks || '').replace(/"/g, '&quot;')}">${item.description || item.remarks || '-'}</td>
+        <td class="px-4 py-3 text-xs text-right font-mono font-bold text-gray-900">${item.amount ? item.amount.toLocaleString() : '-'}</td>
+        <td class="px-4 py-3 text-xs text-gray-500">${item.transfer_date || item.reference || '-'}</td>
+      </tr>
+    `).join("");
+
+    detailPanel.innerHTML = `
+      <div class="flex justify-between items-start mb-6">
+        <div class="flex items-start gap-4">
+          <div class="w-16 h-16 rounded-xl bg-gradient-to-br from-emerald-500 to-teal-600 flex items-center justify-center text-white shadow-lg">
+            <svg class="w-8 h-8" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 10h18M7 15h1m4 0h1m-7 4h12a3 3 0 003-3V8a3 3 0 00-3-3H6a3 3 0 00-3 3v8a3 3 0 003 3z"></path>
+            </svg>
+          </div>
+          <div>
+            <h1 class="text-2xl font-bold text-gray-900 mb-1">${eft.eft_reference || d.source_filename || "EFT Payment"}</h1>
+            ${eft.payer_name ? `<p class="text-sm text-gray-500">Payer: ${eft.payer_name}</p>` : ''}
+            ${eft.bank_name ? `<p class="text-xs text-gray-400 mt-1">Bank: ${eft.bank_name}</p>` : ''}
+          </div>
+        </div>
+      </div>
+
+      ${buildMetaGrid([
+        { label: "Payment Date", value: eft.payment_date || "-" },
+        { label: "Currency", value: currency },
+        { label: "Total Amount", value: eft.total_amount ? `${currency} ${eft.total_amount.toLocaleString()}` : "-" },
+        { label: "Payments", value: items.length },
+      ])}
+
+      ${items.length > 0 ? `
+        <h3 class="text-xs font-bold text-gray-500 uppercase tracking-wider mb-3">Payment Details</h3>
+        ${buildTable(
+          [
+            { label: "Beneficiary" },
+            { label: "Bank" },
+            { label: "Description / Narration" },
+            { label: "Amount (AED)", align: "right" },
+            { label: "Date / Ref" },
+          ],
+          itemsHtml
+        )}
+
+        <div class="flex justify-end mb-6">
+          <div class="w-72 bg-white rounded-lg border border-gray-200 p-4 shadow-md">
+            <div class="flex justify-between text-base font-bold text-gray-900 pt-2">
+              <span>Total</span>
+              <span class="font-mono">${currency} ${eft.total_amount ? eft.total_amount.toLocaleString() : '-'}</span>
+            </div>
+          </div>
+        </div>
+      ` : '<p class="text-sm text-gray-400 italic">No payment line items found.</p>'}
+
+      ${eft.notes ? `
+        <div class="bg-yellow-50 border border-yellow-200 rounded-lg p-4">
+          <h3 class="text-xs font-bold text-yellow-900 uppercase tracking-wider mb-2">Notes</h3>
+          <p class="text-sm text-yellow-800">${eft.notes}</p>
+        </div>
+      ` : ''}
+    `;
+  };
+
+  rows.forEach((row, idx) => row.addEventListener("click", () => select(idx)));
+  if (data.length > 0) select(0);
+}
+
+function filterEFTPayments(term) {
+  if (!window.eftPaymentsData) return;
+  const filtered = term
+    ? window.eftPaymentsData.filter(d => {
+        const eft = d.eft_payment || {};
+        return (
+          (eft.eft_reference || '').toLowerCase().includes(term) ||
+          (d.source_filename || '').toLowerCase().includes(term) ||
+          (eft.payment_date || '').toLowerCase().includes(term) ||
+          (eft.payer_name || '').toLowerCase().includes(term)
+        );
+      })
+    : window.eftPaymentsData;
+  renderEFTPaymentsList(filtered);
+}
+
+
+// ============================================================
+// DHOFAR EFT RECONCILIATION VIEW
+// ============================================================
+
+async function renderDhofarReconciliation() {
+  updateHeader("EFT Reconciliation", "...");
+  document.getElementById('search-bar').classList.remove('hidden');
+  renderEmptyState("list-content", "Loading reconciliation...");
+
+  const data = await fetchJSON("/api/dhofar/reconciliation");
+  updateHeader("EFT Reconciliation", data.length);
+  window.dhofarReconData = data;
+
+  if (!data.length) {
+    document.getElementById("list-content").innerHTML = `
+      <div class="p-6 text-center">
+        <p class="text-sm text-gray-500 mb-4">No reconciliation results yet.</p>
+        <button onclick="triggerDhofarRecon()" class="px-4 py-2 bg-amber-600 hover:bg-amber-700 text-white rounded-lg text-sm font-semibold">
+          Run Reconciliation
+        </button>
+      </div>`;
+    return;
+  }
+
+  renderDhofarReconList(data);
+  renderDhofarReconSummary(data);
+}
+
+function renderDhofarReconList(data) {
+  const statusStyles = {
+    matched:   { bg: 'bg-green-50',  border: 'border-l-green-500',  badge: 'bg-green-100 text-green-700',  label: 'MATCHED'   },
+    partial:   { bg: 'bg-amber-50',  border: 'border-l-amber-500',  badge: 'bg-amber-100 text-amber-700',  label: 'PARTIAL'   },
+    unmatched: { bg: 'bg-gray-50',   border: 'border-l-gray-400',   badge: 'bg-gray-100 text-gray-600',    label: 'UNMATCHED' },
+  };
+
+  const listContent = document.getElementById("list-content");
+  listContent.innerHTML = data.map((d, idx) => {
+    const st = statusStyles[d.status] || statusStyles.unmatched;
+    const card = d.matched_card || d.best_candidate || {};
+    const remitter = d.remitter || '-';
+    const amount = d.amount;
+
+    return `
+      <div class="list-item group p-4 border-b border-gray-100 hover:bg-gray-50 cursor-pointer border-l-4 ${st.border} transition-all duration-200" data-index="${idx}">
+        <div class="flex justify-between items-start mb-1.5">
+          <span class="font-bold text-gray-900 group-hover:text-indigo-600 text-sm truncate flex-1 mr-2">${remitter}</span>
+          <span class="text-[10px] font-bold px-2 py-0.5 rounded-full ${st.badge} flex-shrink-0">${st.label}</span>
+        </div>
+        <div class="flex justify-between items-end">
+          <div class="text-[10px] text-gray-500 truncate flex-1">
+            ${card.customer_name ? `→ ${card.customer_name}` : '<span class="italic">No match</span>'}
+          </div>
+          <div class="text-right ml-2 flex-shrink-0">
+            <div class="text-xs font-mono font-bold text-gray-800">AED ${amount ? amount.toLocaleString() : '-'}</div>
+            <div class="text-[9px] text-gray-400">score: ${d.total_score}</div>
+          </div>
+        </div>
+      </div>
+    `;
+  }).join("");
+
+  const rows = document.querySelectorAll(".list-item");
+  rows.forEach((row, idx) => row.addEventListener("click", () => selectDhofarRecon(idx, data)));
+  if (data.length > 0) selectDhofarRecon(0, data);
+}
+
+function selectDhofarRecon(idx, data) {
+  document.querySelectorAll(".list-item").forEach(r => r.classList.remove("active"));
+  const rows = document.querySelectorAll(".list-item");
+  if (rows[idx]) rows[idx].classList.add("active");
+
+  const d = data[idx];
+  const card = d.matched_card || d.best_candidate || {};
+  const detailPanel = document.getElementById("detail-panel");
+
+  const statusColors = {
+    matched:   'bg-green-100 text-green-800 ring-green-600/20',
+    partial:   'bg-amber-100 text-amber-800 ring-amber-600/20',
+    unmatched: 'bg-gray-100 text-gray-700 ring-gray-600/20',
+  };
+  const statusBadgeClass = statusColors[d.status] || statusColors.unmatched;
+
+  // Score bar
+  const scoreBar = (score, max, color) => {
+    const pct = Math.min(100, (score / max) * 100);
+    return `
+      <div class="flex items-center gap-2">
+        <div class="flex-1 bg-gray-200 rounded-full h-2">
+          <div class="h-2 rounded-full ${color}" style="width:${pct}%"></div>
+        </div>
+        <span class="text-xs font-mono w-8 text-right">${score}</span>
+      </div>`;
+  };
+
+  // Candidates table
+  const candidatesHtml = (d.all_candidates || []).map((c, i) => `
+    <tr class="${i === 0 && d.status !== 'unmatched' ? 'bg-green-50' : ''}">
+      <td class="px-3 py-2 text-xs font-medium text-gray-900">${c.customer_name || '-'}</td>
+      <td class="px-3 py-2 text-xs text-gray-600">${c.customer_id || '-'}</td>
+      <td class="px-3 py-2 text-xs text-right font-mono">${c.name_score}</td>
+      <td class="px-3 py-2 text-xs text-right font-mono">${c.amount_score}</td>
+      <td class="px-3 py-2 text-xs text-right font-mono font-bold ${c.total_score >= 50 ? 'text-green-700' : c.total_score >= 35 ? 'text-amber-700' : 'text-gray-500'}">${c.total_score}</td>
+    </tr>
+  `).join("");
+
+  detailPanel.innerHTML = `
+    <div class="mb-6">
+      <div class="flex items-start justify-between mb-4">
+        <div class="flex-1">
+          <div class="flex items-center gap-3 mb-2">
+            <h1 class="text-xl font-bold text-gray-900">${d.remitter || 'Unknown Remitter'}</h1>
+            <span class="inline-flex items-center px-2.5 py-1 rounded-md text-[10px] font-bold ring-1 uppercase ${statusBadgeClass}">${d.status}</span>
+          </div>
+          <p class="text-xs text-gray-500 font-mono">${(d.eft_item || {}).description || ''}</p>
+        </div>
+        <div class="text-right ml-4 flex-shrink-0">
+          <div class="text-2xl font-bold text-gray-900">AED ${d.amount ? d.amount.toLocaleString() : '-'}</div>
+          <div class="text-xs text-gray-500">${d.transfer_date || ''}</div>
+        </div>
+      </div>
+
+      <!-- Score breakdown -->
+      <div class="bg-gradient-to-br from-slate-50 to-white border border-gray-200 rounded-lg p-4 mb-6 shadow-sm">
+        <h3 class="text-xs font-bold text-gray-600 uppercase tracking-wider mb-3">Match Score Breakdown</h3>
+        <div class="grid grid-cols-3 gap-4">
+          <div class="text-center p-3 bg-white rounded-lg border border-gray-200 shadow-sm">
+            <div class="text-2xl font-bold ${d.total_score >= 50 ? 'text-green-600' : d.total_score >= 35 ? 'text-amber-600' : 'text-gray-500'}">${d.total_score}</div>
+            <div class="text-[10px] text-gray-500 uppercase font-bold mt-1">Total Score</div>
+            <div class="text-[9px] text-gray-400">/ 100</div>
+          </div>
+          <div class="p-3 bg-white rounded-lg border border-gray-200 shadow-sm">
+            <div class="text-[10px] text-gray-500 uppercase font-bold mb-2">Name Match (60%)</div>
+            ${scoreBar(d.name_score, 100, 'bg-blue-500')}
+          </div>
+          <div class="p-3 bg-white rounded-lg border border-gray-200 shadow-sm">
+            <div class="text-[10px] text-gray-500 uppercase font-bold mb-2">Amount Match (40%)</div>
+            ${scoreBar(d.amount_score, 40, 'bg-emerald-500')}
+          </div>
+        </div>
+      </div>
+
+      ${card.customer_name ? `
+        <!-- Matched card -->
+        <div class="bg-gradient-to-br from-${d.status === 'matched' ? 'green' : 'amber'}-50 to-white border border-${d.status === 'matched' ? 'green' : 'amber'}-200 rounded-lg p-4 mb-6 shadow-sm">
+          <h3 class="text-xs font-bold text-gray-600 uppercase tracking-wider mb-3">
+            ${d.status === 'matched' ? '✓ Matched Customer Card' : '~ Best Candidate'}
+          </h3>
+          <div class="flex items-center gap-4">
+            <div class="w-12 h-12 rounded-xl bg-gradient-to-br from-amber-500 to-orange-600 flex items-center justify-center text-white font-bold text-xl shadow-md flex-shrink-0">
+              ${(card.customer_name || '?').charAt(0)}
+            </div>
+            <div class="flex-1">
+              <div class="font-bold text-gray-900 text-base">${card.customer_name}</div>
+              <div class="text-xs text-gray-500 mt-0.5">
+                ${card.customer_id ? `ID: ${card.customer_id}` : ''}
+                ${card.account_type ? ` · ${card.account_type}` : ''}
+                ${card.currency ? ` · ${card.currency}` : ''}
+              </div>
+              ${card.credit_limit ? `<div class="text-xs text-gray-500">Credit Limit: ${card.currency || 'AED'} ${card.credit_limit.toLocaleString()}</div>` : ''}
+            </div>
+          </div>
+        </div>
+      ` : `
+        <div class="bg-gray-50 border border-dashed border-gray-300 rounded-lg p-4 mb-6 text-center">
+          <p class="text-sm text-gray-400 italic">No customer card matched this EFT payment</p>
+        </div>
+      `}
+
+      <!-- All candidates -->
+      ${(d.all_candidates || []).length > 0 ? `
+        <h3 class="text-xs font-bold text-gray-500 uppercase tracking-wider mb-3">All Candidates (Top 3)</h3>
+        <div class="bg-white border border-gray-200 rounded-lg shadow-sm overflow-hidden mb-6">
+          <table class="min-w-full divide-y divide-gray-200">
+            <thead class="bg-gray-50">
+              <tr>
+                <th class="px-3 py-2.5 text-left text-[10px] font-bold text-gray-600 uppercase">Customer</th>
+                <th class="px-3 py-2.5 text-left text-[10px] font-bold text-gray-600 uppercase">ID</th>
+                <th class="px-3 py-2.5 text-right text-[10px] font-bold text-gray-600 uppercase">Name</th>
+                <th class="px-3 py-2.5 text-right text-[10px] font-bold text-gray-600 uppercase">Amount</th>
+                <th class="px-3 py-2.5 text-right text-[10px] font-bold text-gray-600 uppercase">Total</th>
+              </tr>
+            </thead>
+            <tbody class="divide-y divide-gray-100">${candidatesHtml}</tbody>
+          </table>
+        </div>
+      ` : ''}
+
+      <!-- Raw EFT description -->
+      <div class="bg-gray-50 border border-gray-200 rounded-lg p-4">
+        <h3 class="text-xs font-bold text-gray-500 uppercase tracking-wider mb-2">Raw EFT Description</h3>
+        <p class="text-xs text-gray-700 font-mono leading-relaxed break-all">${(d.eft_item || {}).description || '-'}</p>
+      </div>
+    </div>
+  `;
+}
+
+function renderDhofarReconSummary(data) {
+  const matched   = data.filter(d => d.status === 'matched');
+  const partial   = data.filter(d => d.status === 'partial');
+  const unmatched = data.filter(d => d.status === 'unmatched');
+  const total     = data.reduce((s, d) => s + (d.amount || 0), 0);
+  const matchedAmt = matched.reduce((s, d) => s + (d.amount || 0), 0);
+  const partialAmt = partial.reduce((s, d) => s + (d.amount || 0), 0);
+
+  // Inject summary into analytics bar area
+  const bar = document.getElementById('analytics-bar');
+  bar.classList.remove('hidden');
+  bar.innerHTML = `
+    <div class="flex items-center justify-between gap-6 flex-wrap">
+      <div class="flex items-center gap-6">
+        <div class="text-center">
+          <div class="text-xl font-bold text-green-600">${matched.length}</div>
+          <div class="text-[7.5px] text-gray-500 uppercase font-semibold mt-1">Matched</div>
+        </div>
+        <div class="text-center">
+          <div class="text-xl font-bold text-amber-600">${partial.length}</div>
+          <div class="text-[7.5px] text-gray-500 uppercase font-semibold mt-1">Partial</div>
+        </div>
+        <div class="text-center">
+          <div class="text-xl font-bold text-gray-500">${unmatched.length}</div>
+          <div class="text-[7.5px] text-gray-500 uppercase font-semibold mt-1">Unmatched</div>
+        </div>
+        <div class="h-10 w-px bg-gray-300"></div>
+        <div class="text-center">
+          <div class="text-xl font-bold text-indigo-600">${Math.round(matched.length / data.length * 100)}%</div>
+          <div class="text-[7.5px] text-gray-500 uppercase font-semibold mt-1">Match Rate</div>
+        </div>
+      </div>
+      <div class="flex items-center gap-3">
+        <div class="text-center px-3 py-2 bg-gradient-to-br from-green-500 to-green-600 rounded-lg shadow-sm min-w-[100px]">
+          <div class="text-sm font-bold text-white">AED ${matchedAmt.toLocaleString()}</div>
+          <div class="text-[8px] text-green-100 uppercase font-bold mt-0.5">Matched</div>
+        </div>
+        <div class="text-center px-3 py-2 bg-gradient-to-br from-amber-500 to-amber-600 rounded-lg shadow-sm min-w-[100px]">
+          <div class="text-sm font-bold text-white">AED ${partialAmt.toLocaleString()}</div>
+          <div class="text-[8px] text-amber-100 uppercase font-bold mt-0.5">Partial</div>
+        </div>
+        <div class="text-center px-3 py-2 bg-gradient-to-br from-blue-500 to-blue-600 rounded-lg shadow-sm min-w-[100px]">
+          <div class="text-sm font-bold text-white">AED ${total.toLocaleString()}</div>
+          <div class="text-[8px] text-blue-100 uppercase font-bold mt-0.5">Total EFT</div>
+        </div>
+        <button onclick="triggerDhofarRecon()" class="px-3 py-2 bg-amber-600 hover:bg-amber-700 text-white rounded-lg text-xs font-semibold transition-all shadow-sm">
+          ↻ Re-run
+        </button>
+      </div>
+    </div>
+  `;
+}
+
+window.triggerDhofarRecon = async () => {
+  showToast('Running Dhofar reconciliation...', 'success');
+  try {
+    const res = await fetch('/api/dhofar/reconcile', { method: 'POST' });
+    const data = await res.json();
+    if (data.success) {
+      const s = data.summary;
+      showToast(`Done: ${s.matched} matched, ${s.partial} partial, ${s.unmatched} unmatched`, 'success');
+      renderDhofarReconciliation();
+    } else {
+      showToast('Reconciliation failed: ' + (data.detail || 'unknown error'), 'error');
+    }
+  } catch (e) {
+    showToast('Error: ' + e.message, 'error');
+  }
+};
+
+function filterDhofarRecon(term) {
+  if (!window.dhofarReconData) return;
+  const filtered = term
+    ? window.dhofarReconData.filter(d => {
+        const card = d.matched_card || d.best_candidate || {};
+        return (
+          (d.remitter || '').toLowerCase().includes(term) ||
+          (card.customer_name || '').toLowerCase().includes(term) ||
+          (card.customer_id || '').toLowerCase().includes(term) ||
+          ((d.eft_item || {}).description || '').toLowerCase().includes(term)
+        );
+      })
+    : window.dhofarReconData;
+  renderDhofarReconList(filtered);
 }

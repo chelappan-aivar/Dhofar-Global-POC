@@ -5,14 +5,14 @@ AutoProcure is an AI-powered procurement document processing and reconciliation 
 ## 🌟 Features
 
 ### Document Processing
-- **AI-Powered Document Extraction**: Uses OpenAI GPT-4o Vision to extract structured data from PDF documents
+- **AI-Powered Document Extraction**: Uses AWS Bedrock (Claude) with vision-style PDF rendering to extract structured data from PDF documents
 - **Multi-Language Support**: Handles documents in English, Japanese, German, Swedish, and more
 - **Document Upload**: Drag-and-drop or browse to upload multiple PDFs simultaneously
 - **Auto-Classification**: Automatically identifies document type (PO, Invoice, or GRN)
 - **Batch Processing**: Upload and process multiple documents at once with progress tracking
 
 ### Reconciliation Engine
-- **AI-Powered Reconciliation**: Uses OpenAI GPT-4o with Pydantic structured outputs for intelligent 3-way matching
+- **AI-Powered Reconciliation**: Uses AWS Bedrock with Pydantic-guided JSON for intelligent 3-way matching
 - **Zero Hardcoded Rules**: AI analyzes documents and makes intelligent decisions without fixed logic
 - **Type-Safe Validation**: Pydantic models ensure structured, validated responses
 - **Agent-Based Processing**: Background reconciliation agent for high-performance matching
@@ -54,7 +54,7 @@ AutoProcure is an AI-powered procurement document processing and reconciliation 
 
 - **Python 3.12+**
 - **MongoDB** (local or remote instance)
-- **OpenAI API Key** with GPT-4o access
+- **AWS account** with **Amazon Bedrock** access for the configured Claude model (and `aws configure` or equivalent credentials)
 - **Poppler** (for PDF to image conversion)
 - **Node.js** (optional, for frontend development)
 
@@ -64,7 +64,7 @@ AutoProcure is an AI-powered procurement document processing and reconciliation 
 
 ```bash
 git clone <repository-url>
-cd ema
+cd autoprocure
 ```
 
 ### 2. Install Python Dependencies
@@ -77,7 +77,7 @@ pip install -r requirements.txt
 - `fastapi` - Web framework
 - `uvicorn` - ASGI server
 - `pymongo` - MongoDB driver
-- `openai` - OpenAI API client
+- `boto3` - AWS SDK (Bedrock runtime)
 - `pdf2image` - PDF processing
 - `reportlab` - PDF generation
 - `pydantic` - Data validation
@@ -115,10 +115,10 @@ sudo systemctl start mongodb
 #### Option B: MongoDB Atlas (Cloud)
 1. Create account at https://www.mongodb.com/cloud/atlas
 2. Create a free cluster
-3. Get connection string
-4. Set environment variable:
+3. In Atlas: **Connect → Drivers** and copy the SRV connection string (replace the placeholder password Atlas shows, or use **Database Access** to create an app user).
+4. Put the URI only in `.env` or your shell — do not commit it. Optional: set `MONGO_USER` and `MONGO_PASSWORD` in `.env` and use a URI without embedded credentials; see `src/mongo_connection.py`.
 ```bash
-export MONGO_URI="mongodb+srv://username:password@cluster.mongodb.net/"
+export MONGO_URI="(paste your Atlas URI here)"
 ```
 
 ### 5. Configure Environment Variables
@@ -126,8 +126,11 @@ export MONGO_URI="mongodb+srv://username:password@cluster.mongodb.net/"
 Create a `.env` file in the project root:
 
 ```bash
-# OpenAI Configuration
-OPENAI_API_KEY=sk-your-api-key-here
+# AWS Bedrock (see also startup.md)
+MODEL_PROVIDER=bedrock
+AWS_REGION=us-east-1
+BEDROCK_MODEL_ID=anthropic.claude-3-5-sonnet-20240620-v1:0
+# Optional: BEDROCK_INFERENCE_PROFILE_ARN=...
 
 # MongoDB Configuration (optional, defaults shown)
 MONGO_URI=mongodb://localhost:27017
@@ -136,7 +139,8 @@ MONGO_DB=ema
 
 Or export directly:
 ```bash
-export OPENAI_API_KEY="sk-your-api-key-here"
+export MODEL_PROVIDER=bedrock
+export AWS_REGION=us-east-1
 export MONGO_URI="mongodb://localhost:27017"
 export MONGO_DB="ema"
 ```
@@ -154,14 +158,14 @@ This creates 30 sample transaction sets (POs, Invoices, GRNs) in `data/simulated
 
 ```bash
 cd ../src
-python ingest_to_mongo.py asst_7LCZgEO8v9EBbFpSuCZ62sDG
+python ingest_to_mongo.py
 ```
 
-**Note**: Replace `asst_7LCZgEO8v9EBbFpSuCZ62sDG` with your OpenAI Assistant ID if different.
+The optional first positional argument is **deprecated** and ignored.
 
 This will:
-- Process all PDFs in the `incoming` folder
-- Extract structured data using GPT-4o
+- Process PDFs under the configured data lake path (default under `data/simulated_data_lake`)
+- Extract structured data using Bedrock
 - Store in MongoDB
 - Move processed files to respective folders (`purchase_orders/`, `invoices/`, `goods_receipts/`)
 
@@ -175,7 +179,7 @@ python reconciliation_agent.py
 ```
 
 This will:
-- Use OpenAI GPT-4o to analyze all POs, Invoices, and GRNs
+- Use Bedrock-backed `LLMClient` to analyze all POs, Invoices, and GRNs
 - Perform intelligent 3-way matching with zero hardcoded rules
 - Calculate approval amounts and deductions using AI
 - Assess risk levels and provide recommendations
@@ -215,7 +219,7 @@ You can upload new documents directly through the UI:
 ## 📁 Project Structure
 
 ```
-ema/
+autoprocure/
 ├── data/
 │   ├── datagen.py                    # PDF generator script
 │   ├── invoices/                     # Processed invoices
@@ -229,7 +233,7 @@ ema/
 │   │   └── static/
 │   │       ├── index.html            # Main UI template
 │   │       └── main.js               # Frontend logic & interactions
-│   ├── processor.py                  # GPT-4o Vision document extraction
+│   ├── processor.py                  # Bedrock document extraction
 │   ├── ingest_to_mongo.py           # Batch ingestion script
 │   ├── reconciliation_agent.py      # AI-powered reconciliation agent
 │   └── RECONCILIATION_AGENT.md      # Agent documentation
@@ -250,19 +254,19 @@ ema/
 AutoProcure uses a sophisticated AI-powered reconciliation system:
 
 **Document Extraction:**
-- GPT-4o Vision extracts structured data from PDF documents
+- Bedrock (via `LLMClient`) extracts structured data from rendered PDF pages
 - Handles multi-language documents automatically
 - Classifies document types (PO, Invoice, GRN)
 
 **Reconciliation Analysis:**
-- GPT-4o with Pydantic structured outputs performs 3-way matching
+- Bedrock with Pydantic JSON schema performs 3-way matching
 - Zero hardcoded business rules - AI makes intelligent decisions
 - Analyzes quantities, prices, deliveries, and patterns
 - Calculates deductions and recommended approval amounts
 - Assesses risk levels and provides actionable recommendations
 
 **Technology Stack:**
-- **OpenAI GPT-4o-2024-08-06**: Latest model with structured outputs
+- **Amazon Bedrock** (Anthropic Claude, model ID from env)
 - **Pydantic**: Type-safe validation and schema enforcement
 - **MongoDB**: Stores pre-computed reconciliation results
 - **FastAPI**: High-performance async API
@@ -430,14 +434,14 @@ mongosh
 mongosh "mongodb+srv://cluster.mongodb.net/" --username <user>
 ```
 
-### OpenAI API Errors
+### Bedrock / AWS errors
 
 ```bash
-# Verify API key is set
-echo $OPENAI_API_KEY
+# Verify region and credentials
+aws sts get-caller-identity
 
-# Test API access
-python -c "from openai import OpenAI; print(OpenAI().models.list())"
+# Confirm Bedrock model access is enabled for the account in the AWS console
+echo "$MODEL_PROVIDER $AWS_REGION $BEDROCK_MODEL_ID"
 ```
 
 ### PDF Processing Errors
@@ -613,15 +617,17 @@ CMD ["uvicorn", "src.app.app:app", "--host", "0.0.0.0", "--port", "8080"]
 Build and run:
 ```bash
 docker build -t autoprocure .
-docker run -p 8080:8080 -e OPENAI_API_KEY=$OPENAI_API_KEY autoprocure
+docker run -p 8080:8080 -e MONGO_URI -e AWS_REGION -e MODEL_PROVIDER=bedrock autoprocure
 ```
 
 ### Environment Variables for Production
 
 ```bash
-OPENAI_API_KEY=sk-prod-key
-MONGO_URI=mongodb+srv://prod-cluster.mongodb.net/
-MONGO_DB=autoprocure_prod
+# Supply via your host or secrets manager — never commit real values
+MODEL_PROVIDER=bedrock
+AWS_REGION=us-east-1
+MONGO_URI=(Atlas or self-hosted URI from secure storage)
+MONGO_DB=ema
 ```
 
 ## 📝 License
@@ -643,7 +649,7 @@ For issues and questions:
 
 ## 🙏 Acknowledgments
 
-- **OpenAI** for GPT-4o Vision and GPT-4o with structured outputs
+- **Amazon Bedrock** for document and reconciliation models
 - **Pydantic** for type-safe data validation
 - **FastAPI** for the excellent async web framework
 - **MongoDB** for flexible document storage

@@ -40,13 +40,15 @@ pdftoppm -v
 
 ## 5) Create `.env` in project root
 
+Set `MONGO_URI` from Atlas **Connect → Drivers** (or use `MONGO_USER` + `MONGO_PASSWORD` per `src/mongo_connection.py`). Do not commit real values.
+
 ```env
 MODEL_PROVIDER=bedrock
 AWS_REGION=us-east-1
 BEDROCK_MODEL_ID=anthropic.claude-sonnet-4-20250514-v1:0
 BEDROCK_INFERENCE_PROFILE_ARN=us.anthropic.claude-sonnet-4-20250514-v1:0
-MONGO_URI=mongodb+srv://<user>:<password>@cluster0.xxxxx.mongodb.net/?appName=Cluster0
-MONGO_DB=autoprocure
+MONGO_URI=
+MONGO_DB=ema
 ```
 
 ## 6) Configure AWS credentials

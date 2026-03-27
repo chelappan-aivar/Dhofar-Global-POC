@@ -7,3 +7,4 @@ pdf2image
 pydantic
 python-dotenv
 python-multipart
+openpyxl

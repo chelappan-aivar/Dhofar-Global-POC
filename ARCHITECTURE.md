@@ -2,15 +2,17 @@
 
 ## Overview
 
-AutoProcure is an event-driven, AI-powered procurement reconciliation system that automates document processing and 3-way matching using two autonomous agents.
+AutoProcure ingests procurement PDFs, stores structured documents in MongoDB, runs AI-assisted three-way reconciliation, and exposes results through a FastAPI application (**Procure Match**) with a static JavaScript UI.
 
 ### System Philosophy
 
-- **Event-Driven**: Components communicate through events, not direct calls
-- **Cloud-Native**: S3 for storage, SQS for messaging, MongoDB for data
-- **AI-First**: GPT-4o handles classification, extraction, and reconciliation
-- **Autonomous**: Agents run independently without manual intervention
-- **Type-Safe**: Pydantic models ensure data integrity
+- **Filesystem-first ingestion**: A CLI scans a folder of PDFs (default: `data/simulated_data_lake`) and upserts into MongoDB; the API also accepts uploads.
+- **MongoDB as source of truth**: Purchase orders, invoices, goods receipts, reconciliation snapshots, and human decisions live in collections.
+- **AI via AWS Bedrock**: `src/llm_client.py` (`LLMClient`) calls Bedrock with JSON-schema-guided prompts; Pydantic validates outputs.
+- **Reconciliation as a job**: `src/reconciliation_agent.py` runs full or per-PO incremental passes; the API can spawn it via `subprocess` after uploads or on demand.
+- **Type-safe I/O**: Pydantic models end to end.
+
+An S3 → SQS → worker pipeline is **not** implemented in this repository; it is a plausible production extension in front of the same `processor` / MongoDB logic.
 
 ---
 
@@ -18,728 +20,162 @@ AutoProcure is an event-driven, AI-powered procurement reconciliation system tha
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│                         User/System                           │
-│                    Uploads PDF to S3                          │
+│  PDFs: API upload and/or folder (e.g. data/simulated_data_lake) │
 └────────────────────────┬─────────────────────────────────────┘
                          │
                          ▼
 ┌──────────────────────────────────────────────────────────────┐
-│                    AWS S3 Raw Bucket                          │
-│              s3://autoprocure-raw/incoming/                   │
-│                                                                │
-│  Event Notification → SQS Queue                               │
+│  INGESTION — src/ingest_to_mongo.py                           │
+│  • Walks --data-lake-path for *.pdf                           │
+│  • processor.py: PDF → images → Bedrock → typed document      │
+│  • Writes invoices | purchase_orders | goods_receipts         │
+│  • Organizes copies under data/invoices, data/purchase_orders,│
+│    data/goods_receipts                                        │
 └────────────────────────┬─────────────────────────────────────┘
                          │
                          ▼
 ┌──────────────────────────────────────────────────────────────┐
-│         AGENT 1: Classification & Extraction Agent            │
-│                                                                │
-│  • Polls SQS for S3 events                                    │
-│  • Downloads PDF from S3                                      │
-│  • Classifies document type (GPT-4o Vision)                   │
-│  • Extracts structured data (GPT-4o Vision)                   │
-│  • Inserts to MongoDB                                         │
-│  • Moves PDF to processed bucket                              │
+│  MongoDB (localhost or Atlas)                                 │
+│  • purchase_orders, invoices, goods_receipts                  │
+│  • reconciliation_results, reconciliation_decisions           │
 └────────────────────────┬─────────────────────────────────────┘
                          │
-                         ▼
-┌──────────────────────────────────────────────────────────────┐
-│                      MongoDB Atlas                            │
-│                                                                │
-│  Collections:                                                 │
-│  • purchase_orders                                            │
-│  • invoices                                                   │
-│  • goods_receipts                                             │
-│  • reconciliation_results                                     │
-│  • reconciliation_decisions                                   │
-│                                                                │
-│  Change Streams → Event Notifications                         │
-└────────────────────────┬─────────────────────────────────────┘
-                         │
-                         ▼
-┌──────────────────────────────────────────────────────────────┐
-│              AGENT 2: Reconciliation Agent                    │
-│                                                                │
-│  • Watches MongoDB change streams                             │
-│  • Detects document insert/update events                      │
-│  • Identifies affected PO(s)                                  │
-│  • Fetches related documents                                  │
-│  • Performs 3-way matching (GPT-4o)                           │
-│  • Calculates approval amounts                                │
-│  • Assesses risk and generates recommendations                │
-│  • Stores reconciliation results                              │
-└────────────────────────┬─────────────────────────────────────┘
-                         │
-                         ▼
-┌──────────────────────────────────────────────────────────────┐
-│                    FastAPI Backend                            │
-│                                                                │
-│  • Serves reconciliation results                              │
-│  • Handles approval decisions                                 │
-│  • Generates S3 presigned URLs for PDFs                       │
-│  • Provides analytics endpoints                               │
-└────────────────────────┬─────────────────────────────────────┘
-                         │
-                         ▼
-┌──────────────────────────────────────────────────────────────┐
-│                   Frontend (Web UI)                           │
-│                                                                │
-│  • Displays reconciliation dashboard                          │
-│  • Shows AI analysis and recommendations                      │
-│  • Approval workflow (Approve/Reject/Dispute)                 │
-│  • Search and filtering                                       │
-└──────────────────────────────────────────────────────────────┘
+         ┌───────────────┴────────────────┐
+         ▼                                ▼
+┌─────────────────────────┐   ┌────────────────────────────────┐
+│  RECONCILIATION         │   │  API — src/app/app.py (FastAPI)   │
+│  src/reconciliation_    │   │  • Lists documents, reconciliation│
+│  agent.py               │   │  • POST /api/reconciliation/run   │
+│  • Full (no args)       │   │  • POST /api/reconciliation/      │
+│  • Incremental (PO#…)  │   │    trigger                        │
+│  • Bedrock + Pydantic   │   │  • Spawns agent subprocesses      │
+└─────────────────────────┘   │  • Static UI: /static             │
+                              └────────────────────────────────┘
 ```
 
 ---
 
-## Agent 1: Classification & Extraction
+## Document ingestion (classification & extraction)
 
 ### Purpose
-Monitors S3 for new PDF uploads, classifies document type, extracts structured data using AI, and organizes files.
 
-### Technology Stack
-- **Language**: Python 3.11+
-- **AWS SDK**: boto3
-- **AI Model**: OpenAI GPT-4o Vision
-- **Validation**: Pydantic
-- **Database**: MongoDB (pymongo)
+Batch-ingest PDFs from a directory, classify each as PO / invoice / GRN, extract structured fields with Bedrock, and upsert into MongoDB. Copies of PDFs are placed under `data/purchase_orders`, `data/invoices`, and `data/goods_receipts` for the UI.
 
-### File
-`src/classification_extraction_agent.py`
+### Technology stack
 
-### Architecture
+- **Language**: Python 3.12+
+- **AWS**: boto3 (Bedrock runtime only for LLM calls; standard AWS credential chain)
+- **AI**: Anthropic on Bedrock via `LLMClient` (`MODEL_PROVIDER=bedrock`)
+- **Validation**: Pydantic (`src/processor.py`)
+- **Database**: PyMongo + shared TLS helpers (`src/mongo_connection.py`)
+
+### Entry point
+
+- **`src/ingest_to_mongo.py`** — CLI: `--data-lake-path`, `--mongo-uri`, `--db-name`, `--limit`
+- **`src/processor.py`** — `InvoicePOGRNClassifier` / image pipeline → `LLMClient.parse_structured`
+
+### Flow (conceptual)
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│        Classification & Extraction Agent (Daemon)            │
-│                                                               │
-│  ┌──────────────────────────────────────────────────────┐   │
-│  │  1. SQS Event Listener                               │   │
-│  │     - Long polling (20 seconds)                      │   │
-│  │     - Batch processing (up to 10 messages)           │   │
-│  │     - Filter: s3:ObjectCreated:* events              │   │
-│  └────────────────────┬─────────────────────────────────┘   │
-│                       │                                      │
-│                       ▼                                      │
-│  ┌──────────────────────────────────────────────────────┐   │
-│  │  2. S3 Download                                       │   │
-│  │     - Download PDF to /tmp                           │   │
-│  │     - Validate file (size, format)                   │   │
-│  └────────────────────┬─────────────────────────────────┘   │
-│                       │                                      │
-│                       ▼                                      │
-│  ┌──────────────────────────────────────────────────────┐   │
-│  │  3. AI Classification & Extraction                   │   │
-│  │     - Convert PDF to base64                          │   │
-│  │     - Call GPT-4o Vision API                         │   │
-│  │     - Classify: PO, Invoice, or GRN                  │   │
-│  │     - Extract: All fields and line items             │   │
-│  │     - Validate with Pydantic models                  │   │
-│  └────────────────────┬─────────────────────────────────┘   │
-│                       │                                      │
-│                       ▼                                      │
-│  ┌──────────────────────────────────────────────────────┐   │
-│  │  4. MongoDB Insert                                    │   │
-│  │     - Insert to appropriate collection               │   │
-│  │     - Store S3 URI reference                         │   │
-│  │     - Add metadata (extracted_at, etc.)              │   │
-│  └────────────────────┬─────────────────────────────────┘   │
-│                       │                                      │
-│                       ▼                                      │
-│  ┌──────────────────────────────────────────────────────┐   │
-│  │  5. S3 Organization                                   │   │
-│  │     - Copy to processed bucket with prefix:          │   │
-│  │       • PO → s3://processed/purchase_orders/         │   │
-│  │       • Invoice → s3://processed/invoices/           │   │
-│  │       • GRN → s3://processed/goods_receipts/         │   │
-│  │     - Optional: Delete from raw bucket               │   │
-│  └────────────────────┬─────────────────────────────────┘   │
-│                       │                                      │
-│                       ▼                                      │
-│  ┌──────────────────────────────────────────────────────┐   │
-│  │  6. SQS Cleanup                                       │   │
-│  │     - Delete message from queue                      │   │
-│  │     - Log success/failure                            │   │
-│  └──────────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────┘
+PDF path → pdf2image → Bedrock (JSON matching Pydantic schema) → document_type
+       → insert/upsert collection (invoices | purchase_orders | goods_receipts)
+       → copy PDF to data/<type-folder>/
 ```
 
-### Key Functions
-
-```python
-import boto3
-import json
-from typing import Dict, Any
-from openai import OpenAI
-from processor import extract_document_data
-
-class ClassificationExtractionAgent:
-    def __init__(self):
-        self.s3 = boto3.client('s3')
-        self.sqs = boto3.client('sqs')
-        self.mongo_client = MongoClient(MONGO_URI)
-        self.db = self.mongo_client[MONGO_DB]
-        self.openai = OpenAI(api_key=OPENAI_API_KEY)
-        
-    def start(self):
-        """Start polling SQS for S3 events"""
-        logger.info("Starting Classification & Extraction Agent...")
-        
-        while self.running:
-            messages = self.poll_sqs()
-            for message in messages:
-                self.process_message(message)
-    
-    def poll_sqs(self) -> list:
-        """Long poll SQS for messages"""
-        response = self.sqs.receive_message(
-            QueueUrl=SQS_QUEUE_URL,
-            MaxNumberOfMessages=10,
-            WaitTimeSeconds=20
-        )
-        return response.get('Messages', [])
-    
-    def process_message(self, message: dict):
-        """Process single SQS message"""
-        try:
-            # Parse S3 event
-            event = json.loads(message['Body'])
-            if 'Message' in event:  # SNS wrapper
-                event = json.loads(event['Message'])
-            
-            # Extract S3 info
-            for record in event.get('Records', []):
-                bucket = record['s3']['bucket']['name']
-                key = record['s3']['object']['key']
-                
-                if key.endswith('.pdf'):
-                    self.process_document(bucket, key)
-            
-            # Delete message after successful processing
-            self.sqs.delete_message(
-                QueueUrl=SQS_QUEUE_URL,
-                ReceiptHandle=message['ReceiptHandle']
-            )
-            
-        except Exception as e:
-            logger.error(f"Error processing message: {e}")
-    
-    def process_document(self, bucket: str, key: str):
-        """Download, classify, extract, store, and organize"""
-        temp_file = f"/tmp/{os.path.basename(key)}"
-        
-        try:
-            # Download from S3
-            self.s3.download_file(bucket, key, temp_file)
-            logger.info(f"Downloaded s3://{bucket}/{key}")
-            
-            # AI Classification & Extraction
-            extraction = extract_document_data(temp_file)
-            doc_type = extraction.document_type
-            
-            # Insert to MongoDB
-            collection_name = {
-                'PURCHASE_ORDER': 'purchase_orders',
-                'INVOICE': 'invoices',
-                'GOODS_RECEIPT': 'goods_receipts'
-            }[doc_type.value]
-            
-            doc_data = {
-                extraction.document_type.value.lower(): extraction.get_document().dict(),
-                'source_pdf_path': f"s3://{PROCESSED_BUCKET}/{collection_name}/{os.path.basename(key)}",
-                'extracted_at': datetime.utcnow().isoformat()
-            }
-            
-            result = self.db[collection_name].insert_one(doc_data)
-            logger.info(f"Inserted to {collection_name}: {result.inserted_id}")
-            
-            # Copy to processed bucket
-            dest_key = f"{collection_name}/{os.path.basename(key)}"
-            self.s3.copy_object(
-                CopySource={'Bucket': bucket, 'Key': key},
-                Bucket=PROCESSED_BUCKET,
-                Key=dest_key
-            )
-            logger.info(f"Copied to s3://{PROCESSED_BUCKET}/{dest_key}")
-            
-        finally:
-            if os.path.exists(temp_file):
-                os.remove(temp_file)
-```
+Indexes for reconciliation links are created in `ingest_to_mongo.py` (e.g. `invoice.reference_po`, `purchase_order.po_number`).
 
 ### Configuration
 
+Set variables in the project root `.env` (loaded by `mongo_connection.load_repo_root_env()`). **Do not commit** real connection strings.
+
 ```bash
-# AWS Configuration
-export AWS_ACCESS_KEY_ID=your_access_key
-export AWS_SECRET_ACCESS_KEY=your_secret_key
-export AWS_REGION=us-east-1
-
-# S3 Buckets
-export S3_RAW_BUCKET=autoprocure-raw
-export S3_PROCESSED_BUCKET=autoprocure-processed
-
-# SQS Queue
-export SQS_QUEUE_URL=https://sqs.us-east-1.amazonaws.com/123456789/autoprocure-s3-events
-
-# OpenAI
-export OPENAI_API_KEY=sk-...
-
-# MongoDB
-export MONGO_URI=mongodb+srv://user:pass@cluster.mongodb.net/
-export MONGO_DB=autoprocure
+MODEL_PROVIDER=bedrock
+AWS_REGION=us-east-1
+BEDROCK_MODEL_ID=...                    # or BEDROCK_INFERENCE_PROFILE_ARN
+MONGO_URI=mongodb://localhost:27017    # or your Atlas URI from the Atlas UI only
+MONGO_DB=ema                            # default in app and agents
+# Optional: MONGO_USER / MONGO_PASSWORD override URI userinfo (see mongo_connection.py)
 ```
 
 ### Running
 
 ```bash
-# Start the agent
-python src/classification_extraction_agent.py
-
-# Or with systemd (production)
-sudo systemctl start classification-extraction-agent
-
-# Or with Docker
-docker run -d --name classification-agent \
-  -e AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID \
-  -e AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY \
-  autoprocure/classification-agent:latest
-```
-
-### AWS Infrastructure Setup
-
-```yaml
-# S3 Buckets
-Resources:
-  RawBucket:
-    Type: AWS::S3::Bucket
-    Properties:
-      BucketName: autoprocure-raw
-      NotificationConfiguration:
-        QueueConfigurations:
-          - Event: s3:ObjectCreated:*
-            Queue: !GetAtt EventQueue.Arn
-            Filter:
-              S3Key:
-                Rules:
-                  - Name: suffix
-                    Value: .pdf
-  
-  ProcessedBucket:
-    Type: AWS::S3::Bucket
-    Properties:
-      BucketName: autoprocure-processed
-      VersioningConfiguration:
-        Status: Enabled
-
-  # SQS Queue
-  EventQueue:
-    Type: AWS::SQS::Queue
-    Properties:
-      QueueName: autoprocure-s3-events
-      VisibilityTimeout: 300
-      MessageRetentionPeriod: 1209600  # 14 days
-      RedrivePolicy:
-        deadLetterTargetArn: !GetAtt DeadLetterQueue.Arn
-        maxReceiveCount: 3
-  
-  DeadLetterQueue:
-    Type: AWS::SQS::Queue
-    Properties:
-      QueueName: autoprocure-s3-events-dlq
+cd src
+python ingest_to_mongo.py
+# python ingest_to_mongo.py --data-lake-path ../data/simulated_data_lake --limit 5
 ```
 
 ---
 
-## Agent 2: Reconciliation
+## Reconciliation agent
 
 ### Purpose
-Watches MongoDB for document changes, performs AI-powered 3-way matching, calculates approval amounts, and provides risk assessments.
 
-### Technology Stack
-- **Language**: Python 3.11+
-- **AI Model**: OpenAI GPT-4o with Structured Outputs
-- **Validation**: Pydantic
-- **Database**: MongoDB with Change Streams
-- **Concurrency**: Threading
+Loads POs, invoices, and goods receipts from MongoDB, calls Bedrock (`LLMClient`) with a Pydantic `ReconciliationResult` schema, merges AI output with deterministic approval math where applicable, and upserts into `reconciliation_results`. The FastAPI app reads these documents and can spawn this script after uploads (`subprocess`) or via `POST /api/reconciliation/run` and `POST /api/reconciliation/trigger`.
 
-### File
+### Technology stack
+
+- **Language**: Python 3.12+
+- **AI**: AWS Bedrock (same `LLMClient` as ingestion)
+- **Validation**: Pydantic models in `reconciliation_agent.py`
+- **Database**: PyMongo (no change streams in this codebase)
+
+### Entry point
+
 `src/reconciliation_agent.py`
 
-### Architecture
+### Flow (conceptual)
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│           Reconciliation Agent (Daemon)                      │
-│                                                               │
-│  ┌──────────────────────────────────────────────────────┐   │
-│  │  1. MongoDB Change Stream Watcher                    │   │
-│  │     - Watch 3 collections simultaneously:            │   │
-│  │       • purchase_orders                              │   │
-│  │       • invoices                                     │   │
-│  │       • goods_receipts                               │   │
-│  │     - Filter: insert and update operations           │   │
-│  │     - Multi-threaded processing                      │   │
-│  └────────────────────┬─────────────────────────────────┘   │
-│                       │                                      │
-│                       ▼                                      │
-│  ┌──────────────────────────────────────────────────────┐   │
-│  │  2. Event Handler                                     │   │
-│  │     - Parse change event                             │   │
-│  │     - Extract affected PO number(s):                 │   │
-│  │       • PO inserted → reconcile that PO              │   │
-│  │       • Invoice inserted → reconcile reference_po    │   │
-│  │       • GRN inserted → reconcile reference_po        │   │
-│  └────────────────────┬─────────────────────────────────┘   │
-│                       │                                      │
-│                       ▼                                      │
-│  ┌──────────────────────────────────────────────────────┐   │
-│  │  3. Fetch Related Documents                          │   │
-│  │     - Query MongoDB for:                             │   │
-│  │       • PO by po_number                              │   │
-│  │       • All invoices with reference_po               │   │
-│  │       • All GRNs with reference_po                   │   │
-│  └────────────────────┬─────────────────────────────────┘   │
-│                       │                                      │
-│                       ▼                                      │
-│  ┌──────────────────────────────────────────────────────┐   │
-│  │  4. AI Reconciliation Analysis                       │   │
-│  │     - Prepare comprehensive context (JSON)           │   │
-│  │     - Call GPT-4o with Pydantic schema               │   │
-│  │     - Perform 3-way matching:                        │   │
-│  │       • Compare PO vs Invoice items                  │   │
-│  │       • Compare PO vs GRN quantities                 │   │
-│  │       • Detect price changes                         │   │
-│  │       • Identify missing items                       │   │
-│  │       • Calculate deductions                         │   │
-│  │     - Assess risk level (low/medium/high)            │   │
-│  │     - Generate recommendations                       │   │
-│  │     - Provide action items                           │   │
-│  └────────────────────┬─────────────────────────────────┘   │
-│                       │                                      │
-│                       ▼                                      │
-│  ┌──────────────────────────────────────────────────────┐   │
-│  │  5. Store Results                                     │   │
-│  │     - Upsert to reconciliation_results               │   │
-│  │     - Include AI analysis and recommendations        │   │
-│  │     - Add timestamp                                  │   │
-│  │     - Log completion                                 │   │
-│  └──────────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────┘
+For each PO (or only requested PO numbers):
+  load PO + linked invoices + GRNs from MongoDB
+       → build JSON context
+       → LLMClient.parse_structured(..., ReconciliationResult)
+       → merge / enrich (e.g. deterministic approval_calculation paths)
+       → store_reconciliation_results (full replace or incremental upsert)
 ```
 
-### Pydantic Models
+### Pydantic models (in code)
 
-```python
-from pydantic import BaseModel, Field
-from typing import List, Optional
-
-class ApprovalCalculation(BaseModel):
-    """Approval amount calculation with deductions"""
-    po_amount: float = Field(description="Purchase order grand total")
-    invoice_amount: float = Field(description="Invoice grand total")
-    recommended_amount: float = Field(description="Amount to approve after deductions")
-    total_deductions: float = Field(description="Sum of all deductions")
-    deduction_details: List[str] = Field(description="Itemized deductions with reasons")
-    calculation_notes: List[str] = Field(description="Explanation notes")
-
-class AIAnalysis(BaseModel):
-    """AI-powered analysis and recommendations"""
-    risk_level: str = Field(description="Risk level: low, medium, or high")
-    recommendation: str = Field(description="Recommendation: approve, reject, investigate, or dispute")
-    reasoning: str = Field(description="Brief explanation of the recommendation")
-    action_items: List[str] = Field(description="Specific actions to take")
-    estimated_impact: str = Field(description="Financial impact description")
-
-class ReconciliationResult(BaseModel):
-    """Complete reconciliation result from AI"""
-    status: str = Field(description="Status: matched, amount_mismatch, missing_invoice, missing_goods_receipt, etc.")
-    issues: List[str] = Field(default_factory=list, description="List of specific issues found")
-    approval_calculation: ApprovalCalculation
-    ai_analysis: Optional[AIAnalysis] = Field(default=None)
-```
-
-### Key Functions
-
-```python
-import threading
-from pymongo import MongoClient
-from openai import OpenAI
-
-class ReconciliationAgent:
-    def __init__(self):
-        self.mongo_client = MongoClient(MONGO_URI)
-        self.db = self.mongo_client[MONGO_DB]
-        self.openai = OpenAI(api_key=OPENAI_API_KEY)
-        self.running = False
-    
-    def start_watching(self):
-        """Start watching MongoDB change streams"""
-        self.running = True
-        logger.info("Starting Reconciliation Agent...")
-        
-        collections = ['purchase_orders', 'invoices', 'goods_receipts']
-        threads = []
-        
-        for coll_name in collections:
-            thread = threading.Thread(
-                target=self.watch_collection,
-                args=(coll_name,),
-                daemon=True
-            )
-            thread.start()
-            threads.append(thread)
-        
-        # Keep main thread alive
-        for thread in threads:
-            thread.join()
-    
-    def watch_collection(self, collection_name: str):
-        """Watch a single collection for changes"""
-        pipeline = [
-            {'$match': {'operationType': {'$in': ['insert', 'update']}}}
-        ]
-        
-        change_stream = self.db[collection_name].watch(pipeline)
-        logger.info(f"Watching {collection_name} for changes...")
-        
-        for change in change_stream:
-            try:
-                self.handle_change(change, collection_name)
-            except Exception as e:
-                logger.error(f"Error handling change in {collection_name}: {e}")
-    
-    def handle_change(self, change: dict, collection_name: str):
-        """Handle a single change event"""
-        document = change['fullDocument']
-        
-        # Extract affected PO number
-        if collection_name == 'purchase_orders':
-            po_number = document['purchase_order']['po_number']
-        elif collection_name == 'invoices':
-            po_number = document['invoice']['reference_po']
-        elif collection_name == 'goods_receipts':
-            po_number = document['goods_receipt']['reference_po']
-        
-        logger.info(f"Change detected in {collection_name}, reconciling {po_number}")
-        
-        # Reconcile the affected PO
-        self.reconcile_po(po_number)
-    
-    def reconcile_po(self, po_number: str):
-        """Reconcile a single PO with AI"""
-        # Fetch all related documents
-        po_doc = self.db.purchase_orders.find_one(
-            {"purchase_order.po_number": po_number}
-        )
-        
-        if not po_doc:
-            logger.warning(f"PO {po_number} not found")
-            return
-        
-        invoices = list(self.db.invoices.find(
-            {"invoice.reference_po": po_number}
-        ))
-        
-        grns = list(self.db.goods_receipts.find(
-            {"goods_receipt.reference_po": po_number}
-        ))
-        
-        # Call AI for reconciliation
-        result = self.reconcile_with_ai(po_doc, invoices, grns)
-        
-        # Store result
-        self.db.reconciliation_results.update_one(
-            {"po_number": po_number},
-            {"$set": {
-                **result,
-                "po_number": po_number,
-                "reconciled_at": datetime.utcnow().isoformat()
-            }},
-            upsert=True
-        )
-        
-        logger.info(f"Reconciled {po_number}: {result['status']}")
-    
-    def reconcile_with_ai(self, po_doc, invoices, grns) -> dict:
-        """Use GPT-4o to perform reconciliation"""
-        # Prepare context
-        context = {
-            "purchase_order": po_doc['purchase_order'],
-            "invoices": [inv['invoice'] for inv in invoices],
-            "goods_receipts": [grn['goods_receipt'] for grn in grns]
-        }
-        
-        prompt = f"""Perform 3-way reconciliation analysis.
-
-PURCHASE ORDER:
-{json.dumps(context['purchase_order'], indent=2)}
-
-INVOICES ({len(invoices)}):
-{json.dumps(context['invoices'], indent=2)}
-
-GOODS RECEIPTS ({len(grns)}):
-{json.dumps(context['goods_receipts'], indent=2)}
-
-Analyze and return structured reconciliation result."""
-        
-        # Call GPT-4o with Pydantic structured outputs
-        completion = self.openai.beta.chat.completions.parse(
-            model="gpt-4o-2024-08-06",
-            messages=[
-                {"role": "system", "content": "You are a procurement reconciliation expert."},
-                {"role": "user", "content": prompt}
-            ],
-            response_format=ReconciliationResult,
-            temperature=0.2
-        )
-        
-        result = completion.choices[0].message.parsed
-        return result.model_dump()
-```
+See `ApprovalCalculation`, `AIAnalysis`, and `ReconciliationResult` in `src/reconciliation_agent.py` — these mirror the Bedrock JSON schema the model must return.
 
 ### Configuration
 
-```bash
-# OpenAI
-export OPENAI_API_KEY=sk-...
+Same `.env` as ingestion: `MODEL_PROVIDER=bedrock`, AWS region and Bedrock model identifiers, and MongoDB settings. **Never commit** Atlas URIs or passwords.
 
-# MongoDB (must have replica set for change streams)
-export MONGO_URI=mongodb+srv://user:pass@cluster.mongodb.net/?replicaSet=rs0
-export MONGO_DB=autoprocure
+```bash
+MODEL_PROVIDER=bedrock
+AWS_REGION=us-east-1
+MONGO_URI=mongodb://localhost:27017
+MONGO_DB=ema
 ```
 
 ### Running
 
 ```bash
-# Event-driven mode (production)
-python src/reconciliation_agent.py --watch
-
-# Full reconciliation (one-time)
-python src/reconciliation_agent.py --full
-
-# Manual reconciliation
-python src/reconciliation_agent.py PO-12345 PO-67890
+cd src
+python reconciliation_agent.py              # full recompute all POs
+python reconciliation_agent.py PO-12345     # incremental for listed POs
 ```
 
-### MongoDB Setup
+There is **no** `--watch` or `--full` flag in the current script; scheduling or API-triggered runs cover production use. Indexes for transactional collections are created by `ingest_to_mongo.py`; `reconciliation_agent.py` / `app.py` ensure indexes on `reconciliation_results`.
 
-```bash
-# Initialize replica set (required for change streams)
-mongosh --eval "rs.initiate()"
+### MongoDB notes
 
-# Create indexes
-mongosh autoprocure --eval '
-  db.purchase_orders.createIndex({"purchase_order.po_number": 1});
-  db.invoices.createIndex({"invoice.reference_po": 1});
-  db.goods_receipts.createIndex({"goods_receipt.reference_po": 1});
-  db.reconciliation_results.createIndex({"po_number": 1});
-'
-```
+A replica set is **not** required for this codebase (no change streams). Use Atlas or a standalone `mongod` as you prefer.
 
 ---
 
 ## Data Flow
 
-### Complete End-to-End Flow
+### End-to-end (as implemented)
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│ Step 1: User uploads PDF to S3 raw bucket                   │
-│         aws s3 cp invoice.pdf s3://autoprocure-raw/incoming/│
-└────────────────────┬────────────────────────────────────────┘
-                     │
-                     ▼ S3 Event Notification
-┌─────────────────────────────────────────────────────────────┐
-│ Step 2: S3 sends event to SQS queue                         │
-└────────────────────┬────────────────────────────────────────┘
-                     │
-                     ▼ SQS Message
-┌─────────────────────────────────────────────────────────────┐
-│ Step 3: Agent 1 polls SQS and receives message              │
-└────────────────────┬────────────────────────────────────────┘
-                     │
-                     ▼ Download
-┌─────────────────────────────────────────────────────────────┐
-│ Step 4: Agent 1 downloads PDF from S3 to /tmp               │
-└────────────────────┬────────────────────────────────────────┘
-                     │
-                     ▼ AI Processing
-┌─────────────────────────────────────────────────────────────┐
-│ Step 5: Agent 1 calls GPT-4o Vision                         │
-│         - Classifies document type                           │
-│         - Extracts all fields and line items                 │
-│         - Returns structured data                            │
-└────────────────────┬────────────────────────────────────────┘
-                     │
-                     ▼ Database Insert
-┌─────────────────────────────────────────────────────────────┐
-│ Step 6: Agent 1 inserts structured data to MongoDB          │
-│         - Collection: invoices                               │
-│         - Stores S3 URI reference                            │
-└────────────────────┬────────────────────────────────────────┘
-                     │
-                     ▼ File Organization
-┌─────────────────────────────────────────────────────────────┐
-│ Step 7: Agent 1 copies PDF to processed bucket              │
-│         s3://autoprocure-processed/invoices/invoice.pdf     │
-└────────────────────┬────────────────────────────────────────┘
-                     │
-                     ▼ SQS Cleanup
-┌─────────────────────────────────────────────────────────────┐
-│ Step 8: Agent 1 deletes SQS message                         │
-└────────────────────┬────────────────────────────────────────┘
-                     │
-                     ▼ Change Stream Event
-┌─────────────────────────────────────────────────────────────┐
-│ Step 9: MongoDB emits change stream event                   │
-│         - Collection: invoices                               │
-│         - Operation: insert                                  │
-└────────────────────┬────────────────────────────────────────┘
-                     │
-                     ▼ Event Received
-┌─────────────────────────────────────────────────────────────┐
-│ Step 10: Agent 2 receives change stream event               │
-│          - Extracts reference_po from invoice                │
-└────────────────────┬────────────────────────────────────────┘
-                     │
-                     ▼ Fetch Documents
-┌─────────────────────────────────────────────────────────────┐
-│ Step 11: Agent 2 fetches related documents                  │
-│          - PO by po_number                                   │
-│          - All invoices with reference_po                    │
-│          - All GRNs with reference_po                        │
-└────────────────────┬────────────────────────────────────────┘
-                     │
-                     ▼ AI Reconciliation
-┌─────────────────────────────────────────────────────────────┐
-│ Step 12: Agent 2 calls GPT-4o for reconciliation            │
-│          - 3-way matching analysis                           │
-│          - Calculates approval amounts                       │
-│          - Assesses risk level                               │
-│          - Generates recommendations                         │
-└────────────────────┬────────────────────────────────────────┘
-                     │
-                     ▼ Store Results
-┌─────────────────────────────────────────────────────────────┐
-│ Step 13: Agent 2 stores reconciliation results              │
-│          - Collection: reconciliation_results                │
-│          - Includes AI analysis                              │
-└────────────────────┬────────────────────────────────────────┘
-                     │
-                     ▼ API Query
-┌─────────────────────────────────────────────────────────────┐
-│ Step 14: Frontend queries FastAPI backend                   │
-│          GET /api/reconciliation                             │
-└────────────────────┬────────────────────────────────────────┘
-                     │
-                     ▼ Display
-┌─────────────────────────────────────────────────────────────┐
-│ Step 15: User sees reconciliation results in UI             │
-│          - Status, issues, AI analysis                       │
-│          - Approval workflow available                       │
-└─────────────────────────────────────────────────────────────┘
+1. PDFs land in data/simulated_data_lake (or another --data-lake-path), and/or user uploads via FastAPI.
+2. ingest_to_mongo.py → processor.py + Bedrock → MongoDB collections + organized files under data/.
+3. reconciliation_agent.py (CLI and/or API-spawned subprocess) → Bedrock → reconciliation_results.
+4. uvicorn serves src/app/app.py → browser loads /static → GET /api/reconciliation and related endpoints.
+5. User records decisions → POST /api/reconciliation/decision → reconciliation_decisions.
 ```
 
 ---
@@ -748,149 +184,53 @@ mongosh autoprocure --eval '
 
 | Layer | Technology | Purpose |
 |-------|-----------|---------|
-| **Storage** | AWS S3 | Object storage for PDFs (raw + processed buckets) |
-| **Event Queue** | AWS SQS | S3 event notifications queue |
-| **Database** | MongoDB Atlas | Document storage with change streams |
-| **Backend** | FastAPI | REST API for frontend |
-| **Frontend** | Vanilla JS + TailwindCSS | Web UI |
-| **AI - Classification** | OpenAI GPT-4o Vision | Document classification and extraction |
-| **AI - Reconciliation** | OpenAI GPT-4o (2024-08-06) | 3-way matching with structured outputs |
+| **PDF storage (dev)** | Local `data/` tree | Simulated lake + organized copies for the UI |
+| **Database** | MongoDB (local or Atlas) | Documents + reconciliation snapshots + decisions |
+| **Backend** | FastAPI (`src/app/app.py`) | REST API, upload, reconciliation triggers |
+| **Frontend** | Vanilla JS + Tailwind (`src/app/static`) | Dashboard, reconciliation, approvals |
+| **AI (ingestion + recon)** | AWS Bedrock (Anthropic) via `LLMClient` | Structured JSON extraction and matching |
 | **Validation** | Pydantic | Type-safe schemas |
-| **Cloud SDK** | boto3 | AWS service integration |
-| **Concurrency** | Threading | Multi-threaded event processing |
-| **Language** | Python 3.11+ | All backend components |
+| **Cloud SDK** | boto3 | Bedrock runtime + optional future S3 |
+| **Language** | Python 3.12+ | Ingestion, agent, API |
 
 ---
 
 ## Deployment
 
-### Local Development
+### Local development (this repository)
+
+Prerequisites: Python 3.12+, Poppler, MongoDB reachable from your machine, AWS credentials with Bedrock invoke access, `.env` at repo root (see `startup.md`).
 
 ```bash
-# Terminal 1: Start MongoDB with replica set
-mongod --replSet rs0 --dbpath /data/db
-mongosh --eval "rs.initiate()"
-
-# Terminal 2: Start Agent 1
-export AWS_ACCESS_KEY_ID=...
-export AWS_SECRET_ACCESS_KEY=...
-export S3_RAW_BUCKET=autoprocure-raw
-export S3_PROCESSED_BUCKET=autoprocure-processed
-export SQS_QUEUE_URL=https://sqs...
-export OPENAI_API_KEY=sk-...
-export MONGO_URI=mongodb://localhost:27017/?replicaSet=rs0
-
-python src/classification_extraction_agent.py
-
-# Terminal 3: Start Agent 2
-export OPENAI_API_KEY=sk-...
-export MONGO_URI=mongodb://localhost:27017/?replicaSet=rs0
-
-python src/reconciliation_agent.py --watch
-
-# Terminal 4: Start FastAPI
-cd src/app
-uvicorn app:app --reload --port 8080
-
-# Terminal 5: Test upload
-aws s3 cp test.pdf s3://autoprocure-raw/incoming/
+cd src
+python ingest_to_mongo.py
+python reconciliation_agent.py
+cd app
+uvicorn app:app --host 0.0.0.0 --port 8080 --reload
 ```
 
-### Production Deployment
+The API can also run full or incremental reconciliation via `POST /api/reconciliation/run` and `POST /api/reconciliation/trigger`, and may spawn `reconciliation_agent.py` in the background after PDF upload.
 
-#### Option 1: EC2/ECS
+### Production-oriented notes
+
+- Run **ingestion** on a schedule or when new files appear (today: directory scan; wiring S3 → Lambda/worker would be custom).
+- Run **reconciliation** on a schedule or rely on API-triggered subprocesses; at scale prefer a job queue instead of `subprocess`.
+- Inject `MONGO_URI` and AWS credentials via your platform’s secret store; never commit credentials to git.
+
+### Illustrative container layout (not defined in-repo)
 
 ```yaml
-# docker-compose.yml
-version: '3.8'
-
+# Example only — build your own image and CMD
 services:
-  classification-agent:
-    image: autoprocure/classification-agent:latest
-    environment:
-      - AWS_ACCESS_KEY_ID
-      - AWS_SECRET_ACCESS_KEY
-      - S3_RAW_BUCKET
-      - S3_PROCESSED_BUCKET
-      - SQS_QUEUE_URL
-      - OPENAI_API_KEY
-      - MONGO_URI
-    restart: always
-    
-  reconciliation-agent:
-    image: autoprocure/reconciliation-agent:latest
-    environment:
-      - OPENAI_API_KEY
-      - MONGO_URI
-    command: ["--watch"]
-    restart: always
-    
   api:
-    image: autoprocure/api:latest
-    ports:
-      - "8080:8080"
+    image: your-registry/autoprocure-api
+    ports: ["8080:8080"]
     environment:
       - MONGO_URI
-      - S3_PROCESSED_BUCKET
-    restart: always
-```
-
-#### Option 2: AWS Lambda (Serverless)
-
-```python
-# Agent 1 as Lambda function
-def lambda_handler(event, context):
-    """Triggered by SQS"""
-    agent = ClassificationExtractionAgent()
-    
-    for record in event['Records']:
-        agent.process_message(record)
-    
-    return {'statusCode': 200}
-
-# Agent 2 as Lambda function
-def lambda_handler(event, context):
-    """Triggered by MongoDB Atlas Triggers"""
-    agent = ReconciliationAgent()
-    
-    for change in event['changes']:
-        agent.handle_change(change)
-    
-    return {'statusCode': 200}
-```
-
-#### Option 3: Kubernetes
-
-```yaml
-# k8s/classification-agent-deployment.yaml
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: classification-agent
-spec:
-  replicas: 2
-  selector:
-    matchLabels:
-      app: classification-agent
-  template:
-    metadata:
-      labels:
-        app: classification-agent
-    spec:
-      containers:
-      - name: agent
-        image: autoprocure/classification-agent:latest
-        env:
-        - name: AWS_ACCESS_KEY_ID
-          valueFrom:
-            secretKeyRef:
-              name: aws-credentials
-              key: access-key-id
-        - name: OPENAI_API_KEY
-          valueFrom:
-            secretKeyRef:
-              name: openai-credentials
-              key: api-key
+      - MONGO_DB
+      - MODEL_PROVIDER=bedrock
+      - AWS_REGION
+      - BEDROCK_MODEL_ID
 ```
 
 ---
@@ -906,15 +246,14 @@ import structlog
 # Structured logging
 logger = structlog.get_logger()
 
-# Agent 1 logs
-logger.info("document_processed", 
-    bucket=bucket,
-    key=key,
+# Ingestion logs (example fields)
+logger.info("document_processed",
+    path=str(pdf_path),
     doc_type=doc_type,
     processing_time=elapsed
 )
 
-# Agent 2 logs
+# Reconciliation logs (example fields)
 logger.info("reconciliation_completed",
     po_number=po_number,
     status=status,
@@ -928,12 +267,12 @@ logger.info("reconciliation_completed",
 ```python
 from prometheus_client import Counter, Histogram, Gauge
 
-# Agent 1 metrics
+# Ingestion metrics (examples)
 documents_processed = Counter('documents_processed_total', 'Total documents processed', ['doc_type'])
 processing_time = Histogram('document_processing_seconds', 'Document processing time')
 extraction_errors = Counter('extraction_errors_total', 'Extraction errors')
 
-# Agent 2 metrics
+# Reconciliation metrics (examples)
 reconciliations_completed = Counter('reconciliations_completed_total', 'Total reconciliations', ['status'])
 reconciliation_time = Histogram('reconciliation_seconds', 'Reconciliation time')
 ai_api_calls = Counter('ai_api_calls_total', 'AI API calls', ['model'])
@@ -942,92 +281,35 @@ ai_api_calls = Counter('ai_api_calls_total', 'AI API calls', ['model'])
 ### Health Checks
 
 ```python
-# Agent 1 health check
+# Example: extend FastAPI with dependency checks as needed
 @app.get("/health")
 def health_check():
-    return {
-        "status": "healthy",
-        "sqs_connected": check_sqs_connection(),
-        "s3_accessible": check_s3_access(),
-        "mongo_connected": check_mongo_connection(),
-        "last_processed": last_processed_timestamp
-    }
-
-# Agent 2 health check
-@app.get("/health")
-def health_check():
-    return {
-        "status": "healthy",
-        "mongo_connected": check_mongo_connection(),
-        "change_streams_active": check_change_streams(),
-        "last_reconciled": last_reconciled_timestamp
-    }
+    return {"status": "healthy", "mongo": ping_mongodb()}
 ```
 
 ---
 
 ## Security
 
-### AWS IAM Policies
+### AWS IAM (Bedrock)
 
-```json
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Effect": "Allow",
-      "Action": [
-        "s3:GetObject",
-        "s3:PutObject",
-        "s3:CopyObject"
-      ],
-      "Resource": [
-        "arn:aws:s3:::autoprocure-raw/*",
-        "arn:aws:s3:::autoprocure-processed/*"
-      ]
-    },
-    {
-      "Effect": "Allow",
-      "Action": [
-        "sqs:ReceiveMessage",
-        "sqs:DeleteMessage",
-        "sqs:GetQueueAttributes"
-      ],
-      "Resource": "arn:aws:sqs:us-east-1:123456789:autoprocure-s3-events"
-    }
-  ]
-}
-```
+Grant the runtime role or IAM user permission to invoke the configured foundation model (and inference profile ARN if used). Add S3 permissions only if you introduce object storage for PDFs.
 
-### MongoDB Security
+### MongoDB security
 
-```javascript
-// Create application user with limited permissions
-db.createUser({
-  user: "autoprocure_app",
-  pwd: "secure_password",
-  roles: [
-    { role: "readWrite", db: "autoprocure" }
-  ]
-})
+- Use Atlas **Database Access** users with least privilege, or a self-hosted user scoped to the application database.
+- Store `MONGO_URI` (or `MONGO_USER` / `MONGO_PASSWORD`) in environment variables or a secrets manager — never in the repository.
 
-// Enable authentication
-mongod --auth --replSet rs0
-```
-
-### API Key Management
+### Secrets management
 
 ```bash
-# Use AWS Secrets Manager
+# Example: store Mongo URI in AWS Secrets Manager (name is illustrative)
 aws secretsmanager create-secret \
-  --name autoprocure/openai-api-key \
-  --secret-string "sk-..."
+  --name autoprocure/mongo-uri \
+  --secret-string "YOUR_MONGO_URI"
 
-# Retrieve in application
-import boto3
-secrets = boto3.client('secretsmanager')
-response = secrets.get_secret_value(SecretId='autoprocure/openai-api-key')
-OPENAI_API_KEY = response['SecretString']
+# Retrieve at runtime (application or task definition)
+# Use the returned SecretString as MONGO_URI in the process environment.
 ```
 
 ---
@@ -1057,12 +339,12 @@ OPENAI_API_KEY = response['SecretString']
 }
 ```
 
-### OpenAI API Optimization
+### Bedrock usage
 
-- **Agent 1**: Uses GPT-4o Vision (~$0.01 per document)
-- **Agent 2**: Uses GPT-4o with structured outputs (~$0.02 per reconciliation)
-- **Caching**: Store results to avoid re-processing
-- **Batch Processing**: Process multiple documents in parallel
+- **Ingestion**: One model invocation per PDF (classification + extraction path in `processor.py`).
+- **Reconciliation**: One invocation per PO reconciled (plus any API-triggered reruns).
+- **Caching**: MongoDB stores extracted documents and `reconciliation_results` to avoid redundant work when data is unchanged.
+- **Batching**: `ingest_to_mongo.py` processes files sequentially by default; parallel ingestion would be an application-level change.
 
 ### MongoDB Optimization
 
@@ -1074,53 +356,33 @@ OPENAI_API_KEY = response['SecretString']
 
 ## Troubleshooting
 
-### Agent 1 Issues
+### Ingestion issues
 
-**Problem**: Documents not being processed
+**Problem**: PDFs not appearing in MongoDB
 
-```bash
-# Check SQS queue
-aws sqs get-queue-attributes \
-  --queue-url $SQS_QUEUE_URL \
-  --attribute-names ApproximateNumberOfMessages
-
-# Check S3 event notifications
-aws s3api get-bucket-notification-configuration \
-  --bucket autoprocure-raw
-
-# Check agent logs
-tail -f logs/classification_agent.log
-```
+- Confirm `--data-lake-path` exists and contains `.pdf` files.
+- Run `cd src && python ingest_to_mongo.py` and watch stderr for Bedrock or TLS errors.
+- Verify `MODEL_PROVIDER=bedrock`, region, and model access in the AWS account.
 
 **Problem**: Extraction errors
 
 ```bash
-# Test extraction locally
+cd src
 python -c "
-from processor import extract_document_data
-result = extract_document_data('test.pdf')
-print(result)
+from pathlib import Path
+from processor import InvoicePOGRNClassifier
+r = InvoicePOGRNClassifier().classify_pdf(Path('path/to/sample.pdf'))
+print(r.model_dump_json(indent=2))
 "
 ```
 
-### Agent 2 Issues
+### Reconciliation issues
 
-**Problem**: Reconciliations not running
+**Problem**: UI shows stale or empty reconciliation
 
-```bash
-# Check MongoDB change streams
-mongosh --eval "
-  db.getMongo().watch([
-    {\$match: {operationType: 'insert'}}
-  ]).hasNext()
-"
-
-# Check replica set status
-mongosh --eval "rs.status()"
-
-# Check agent logs
-tail -f logs/reconciliation_agent.log
-```
+- Run `cd src && python reconciliation_agent.py` for a full recompute, or call `POST /api/reconciliation/run` while the API is up.
+- Confirm `reconciliation_results` has documents: `mongosh` / Compass on your `MONGO_DB`.
+- If the API spawn fails, run the agent manually in another terminal (same `.env` as the API).
 
 ---
 
@@ -1146,6 +408,6 @@ tail -f logs/reconciliation_agent.log
 
 ---
 
-**Document Version**: 2.0  
-**Last Updated**: December 8, 2024  
-**Architecture**: Event-Driven with Two Autonomous Agents
+**Document Version**: 3.0  
+**Last Updated**: March 27, 2025  
+**Architecture**: Local/Atlas MongoDB + Bedrock LLM + FastAPI (batch ingestion and job-style reconciliation)

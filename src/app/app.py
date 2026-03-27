@@ -1104,6 +1104,154 @@ async def get_outflow_analysis() -> Dict[str, Any]:
     }
 
 
+@app.get("/api/dhofar/reconciliation")
+async def get_dhofar_reconciliation() -> List[Dict[str, Any]]:
+    """Get stored Dhofar EFT ↔ Customer Card reconciliation results."""
+    coll = db["dhofar_reconciliation_results"]
+    docs = list(coll.find().sort("total_score", -1))
+    for doc in docs:
+        if "_id" in doc and isinstance(doc["_id"], ObjectId):
+            doc["_id"] = str(doc["_id"])
+    return docs
+
+
+@app.get("/api/dhofar/reconciliation/card/{card_id}")
+async def get_dhofar_reconciliation_for_card(card_id: str) -> List[Dict[str, Any]]:
+    """Get matched EFT rows for a specific customer card."""
+    import sys as _sys
+    _sys.path.insert(0, str(Path(__file__).parent.parent))
+    from dhofar_reconciliation import get_reconciliation_for_card
+    return get_reconciliation_for_card(card_id, db)
+
+
+@app.post("/api/dhofar/reconcile")
+async def run_dhofar_reconciliation() -> Dict[str, Any]:
+    """Trigger Dhofar EFT ↔ Customer Card reconciliation."""
+    import sys as _sys
+    _sys.path.insert(0, str(Path(__file__).parent.parent))
+    from dhofar_reconciliation import run_dhofar_reconciliation as _run
+    try:
+        summary = _run(db)
+        return {"success": True, "summary": summary}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/customer_cards")
+async def list_customer_cards() -> List[Dict[str, Any]]:
+    """Get all Dhofar customer cards."""
+    coll = db["customer_cards"]
+    docs = [_serialize_doc(doc) for doc in coll.find().sort("customer_card.customer_name", 1)]
+    return docs
+
+
+@app.get("/api/eft_payments")
+async def list_eft_payments() -> List[Dict[str, Any]]:
+    """Get all Dhofar EFT payment records."""
+    coll = db["eft_payments"]
+    docs = [_serialize_doc(doc) for doc in coll.find().sort("eft_payment.payment_date", -1)]
+    return docs
+
+
+@app.post("/api/upload_dhofar")
+async def upload_dhofar_document(file: UploadFile = File(...)) -> Dict[str, Any]:
+    """
+    Upload a Dhofar document (Customer Card PDF or EFT Excel file).
+    Automatically classifies and stores in MongoDB.
+    """
+    filename = file.filename or ""
+    is_pdf = filename.lower().endswith(".pdf")
+    is_excel = filename.lower().endswith(".xlsx") or filename.lower().endswith(".xls")
+
+    if not (is_pdf or is_excel):
+        raise HTTPException(status_code=400, detail="Only PDF or Excel files are supported")
+
+    suffix = ".pdf" if is_pdf else (".xlsx" if filename.lower().endswith(".xlsx") else ".xls")
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp_file:
+        tmp_path = tmp_file.name
+        shutil.copyfileobj(file.file, tmp_file)
+
+    try:
+        if is_pdf:
+            import sys as _sys
+            _sys.path.insert(0, str(Path(__file__).parent.parent))
+            from dhofar_processor import CustomerCardClassifier
+
+            classifier = CustomerCardClassifier()
+            result = classifier.classify_pdf(tmp_path)
+
+            # Save to permanent location
+            dest_dir = Path(__file__).parent.parent.parent / "Dhofar" / "Invoices"
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            dest_path = dest_dir / filename
+            counter = 1
+            while dest_path.exists():
+                stem, ext = filename.rsplit(".", 1)
+                dest_path = dest_dir / f"{stem}_{counter}.{ext}"
+                counter += 1
+            shutil.move(tmp_path, str(dest_path))
+
+            payload = result.model_dump()
+            payload["source_file_path"] = str(dest_path)
+            payload["uploaded_at"] = datetime.utcnow().isoformat()
+
+            coll = db["customer_cards"]
+            inserted = coll.insert_one(payload)
+
+            card = result.customer_card
+            return {
+                "success": True,
+                "document_type": "customer_card",
+                "customer_name": card.customer_name if card else "Unknown",
+                "customer_id": card.customer_id if card else None,
+                "mongo_id": str(inserted.inserted_id),
+                "file_path": str(dest_path),
+            }
+
+        else:
+            # Excel EFT file
+            import sys as _sys
+            _sys.path.insert(0, str(Path(__file__).parent.parent))
+            from ingest_dhofar import process_eft_excel
+
+            dest_dir = Path(__file__).parent.parent.parent / "Dhofar" / "PO"
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            dest_path = dest_dir / filename
+            counter = 1
+            while dest_path.exists():
+                stem, ext = filename.rsplit(".", 1)
+                dest_path = dest_dir / f"{stem}_{counter}.{ext}"
+                counter += 1
+            shutil.move(tmp_path, str(dest_path))
+
+            payload = process_eft_excel(dest_path)
+            payload["source_file_path"] = str(dest_path)
+
+            coll = db["eft_payments"]
+            inserted = coll.insert_one(payload)
+            eft = payload.get("eft_payment", {})
+
+            return {
+                "success": True,
+                "document_type": "eft_payment",
+                "eft_reference": eft.get("eft_reference"),
+                "total_amount": eft.get("total_amount"),
+                "mongo_id": str(inserted.inserted_id),
+                "file_path": str(dest_path),
+            }
+
+    except Exception as e:
+        if Path(tmp_path).exists():
+            Path(tmp_path).unlink()
+        raise HTTPException(status_code=500, detail=f"Error processing document: {str(e)}")
+    finally:
+        if Path(tmp_path).exists():
+            try:
+                Path(tmp_path).unlink()
+            except Exception:
+                pass
+
+
 @app.get("/")
 async def root():
     index_path = BASE_DIR / "static" / "index.html"
