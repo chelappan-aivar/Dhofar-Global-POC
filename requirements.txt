@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+pymongo
+boto3
+certifi
+pdf2image
+pydantic
+python-dotenv
+python-multipart
