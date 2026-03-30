@@ -1,136 +1,99 @@
 """
 dhofar_reconciliation.py
 
-Reconciles EFT payment rows against Customer Card statement rows.
+Full 5-pass reconciliation engine:
+  Pass 1 – Direct invoice-number match (doc_no found in bank description)
+  Pass 2 – Customer name + exact amount
+  Pass 3 – Customer name + combination of invoices (2-3) summing to bank amount
+  Pass 4 – Partial payment (bank < invoice, strong name match)
+  Pass 5 – Processor / POS settlement accounts
 
-Logic:
-  For each EFT row, find the best-matching statement row across all cards using:
-    - Name score  (50 pts): fuzzy match of EFT remitter vs card customer_name
-    - Amount score (30 pts): EFT amount vs statement row original_amount
-    - Date score  (20 pts): EFT transfer_date vs statement row posting_date
-
-  A match is accepted at total_score >= 40.
-
-  Results are stored per-card so the UI can show "accepted EFT rows" inside
-  each customer card.
-
-Run:
-    cd src && python dhofar_reconciliation.py
+Tables (MongoDB collections):
+  bank_transactions      – one row per bank line, with match-tracking columns
+  customer_open_items    – one row per open invoice/credit, with cleared columns
+  recon_matched_pairs    – audit log of every allocation made
 """
 
 from __future__ import annotations
 
-import os
-import re
-import unicodedata
+import os, re, unicodedata
 from datetime import datetime, date
-from typing import Any, Dict, List, Optional
-
+from itertools import combinations
+from typing import Any, Dict, List, Optional, Tuple
 from bson import ObjectId
 from mongo_connection import load_repo_root_env, make_mongo_client, require_mongo_auth
 
 load_repo_root_env()
-
 MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
 MONGO_DB  = os.getenv("MONGO_DB", "ema")
 
+AMOUNT_TOL   = 0.05   # AED tolerance for "exact" amount match
+COMBO_MAX    = 3      # max invoices in a combination
+NAME_THRESH  = 45.0   # minimum fuzzy name score to consider a customer match
 
-# ---------------------------------------------------------------------------
-# Text / date helpers
-# ---------------------------------------------------------------------------
+# Processor remitters that are NOT end-customers
+PROCESSOR_KEYWORDS = ["NETWORK INTERNATIONAL", "MASTERCARD", "VISA", "NEOPAY",
+                       "MAGNATI", "CHECKOUT", "ADYEN", "STRIPE"]
 
-def _normalize(text: str) -> str:
-    text = unicodedata.normalize("NFKD", text)
-    text = text.encode("ascii", "ignore").decode("ascii")
-    text = text.lower()
-    text = re.sub(r"[^a-z0-9\s]", " ", text)
-    return re.sub(r"\s+", " ", text).strip()
+# ─────────────────────────────────────────────────────────────────────────────
+# TEXT / DATE HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _norm(text: str) -> str:
+    """Uppercase, strip accents, collapse spaces, drop punctuation."""
+    t = unicodedata.normalize("NFKD", str(text))
+    t = t.encode("ascii", "ignore").decode("ascii").upper()
+    t = re.sub(r"[^A-Z0-9\s]", " ", t)
+    return re.sub(r"\s+", " ", t).strip()
 
 
 def _token_set(a: str, b: str) -> float:
-    sa = set(_normalize(a).split())
-    sb = set(_normalize(b).split())
-    if not sa or not sb:
-        return 0.0
+    sa, sb = set(_norm(a).split()), set(_norm(b).split())
+    if not sa or not sb: return 0.0
     inter = sa & sb
-    union = sa | sb
-    j = len(inter) / len(union)
+    j = len(inter) / len(sa | sb)
     bonus = 0.15 if (sa <= sb or sb <= sa) else 0.0
     return min(100.0, (j + bonus) * 100)
 
 
-def _lcs_ratio(a: str, b: str) -> float:
-    a, b = _normalize(a)[:150], _normalize(b)[:150]
-    if not a or not b:
-        return 0.0
+def _lcs(a: str, b: str) -> float:
+    a, b = _norm(a)[:120], _norm(b)[:120]
+    if not a or not b: return 0.0
     m, n = len(a), len(b)
-    dp = [[0] * (n + 1) for _ in range(m + 1)]
-    for i in range(1, m + 1):
-        for j in range(1, n + 1):
-            dp[i][j] = dp[i-1][j-1] + 1 if a[i-1] == b[j-1] else max(dp[i-1][j], dp[i][j-1])
+    dp = [[0]*(n+1) for _ in range(m+1)]
+    for i in range(1, m+1):
+        for j in range(1, n+1):
+            dp[i][j] = dp[i-1][j-1]+1 if a[i-1]==b[j-1] else max(dp[i-1][j], dp[i][j-1])
     return dp[m][n] / max(m, n) * 100
 
 
-def name_similarity(a: str, b: str) -> float:
-    return max(_token_set(a, b), _lcs_ratio(a, b))
+def name_sim(a: str, b: str) -> float:
+    return max(_token_set(a, b), _lcs(a, b))
 
 
-def _parse_date(s: Optional[str]) -> Optional[date]:
-    """Parse DD/MM/YY, DD/MM/YYYY, YYYY-MM-DD."""
-    if not s:
-        return None
-    s = str(s).strip()
-    for fmt in ("%d/%m/%y", "%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y", "%d-%m-%y"):
-        try:
-            return datetime.strptime(s, fmt).date()
-        except ValueError:
-            pass
+def _parse_date(s: Any) -> Optional[date]:
+    if not s: return None
+    for fmt in ("%d/%m/%y", "%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y", "%d-%m-%y",
+                "%m/%d/%Y", "%d %b %Y"):
+        try: return datetime.strptime(str(s).strip(), fmt).date()
+        except ValueError: pass
     return None
 
 
-def date_score(eft_date: Optional[str], stmt_date: Optional[str]) -> float:
-    """
-    Score date proximity (0-20):
-      same day → 20, within 3 days → 15, within 7 → 10, within 30 → 5, else 0
-    """
-    d1 = _parse_date(eft_date)
-    d2 = _parse_date(stmt_date)
-    if d1 is None or d2 is None:
-        return 10.0  # neutral when date missing
-    diff = abs((d1 - d2).days)
-    if diff == 0:
-        return 20.0
-    if diff <= 3:
-        return 15.0
-    if diff <= 7:
-        return 10.0
-    if diff <= 30:
-        return 5.0
-    return 0.0
+def _amt(v: Any) -> float:
+    if v is None: return 0.0
+    try: return float(str(v).replace(",", "").strip())
+    except: return 0.0
 
 
-def amount_score(eft_amt: Optional[float], stmt_amt: Optional[float]) -> float:
-    """
-    Score amount match (0-30):
-      exact (±0.01) → 30, within 1% → 22, within 5% → 12, within 20% → 5, else 0
-    """
-    if eft_amt is None or stmt_amt is None or stmt_amt == 0:
-        return 10.0  # neutral
-    diff_pct = abs(eft_amt - stmt_amt) / abs(stmt_amt) * 100
-    if diff_pct <= 0.01:
-        return 30.0
-    if diff_pct <= 1.0:
-        return 22.0
-    if diff_pct <= 5.0:
-        return 12.0
-    if diff_pct <= 20.0:
-        return 5.0
-    return 0.0
+# ─────────────────────────────────────────────────────────────────────────────
+# PARSING HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
 
-
-# ---------------------------------------------------------------------------
-# Remitter extraction
-# ---------------------------------------------------------------------------
+_DOC_PATTERN = re.compile(
+    r"\b(DICSI\d{8,}|DGURFT\d{7,}|INV[-\s]?\d{4,}|SHJZARWT\d{10,})\b",
+    re.IGNORECASE,
+)
 
 _REMITTER_PATTERNS = [
     r"Remitter\s+Info[:\s]+([A-Z][A-Z0-9 &\.\-\(\)\/]+?)(?:,|\s{2,}|Sender:|Value Date:)",
@@ -140,256 +103,561 @@ _REMITTER_PATTERNS = [
     r"TRANSFER\s+.*?-\s+([A-Z][A-Z0-9 &\.\-\(\)\/]+?)\s+-",
 ]
 
-def extract_remitter(description: str) -> str:
+def _extract_remitter(desc: str) -> str:
     for pat in _REMITTER_PATTERNS:
-        m = re.search(pat, description, re.IGNORECASE)
+        m = re.search(pat, desc, re.IGNORECASE)
         if m:
             c = m.group(1).strip()
-            c = re.sub(r"\s+(OPC|LLC|LTD|INVOICE|NO|REF|AED|FT|IPP)\s*.*$", "", c, flags=re.IGNORECASE).strip()
+            c = re.sub(r"\s+(OPC|LLC|LTD|INVOICE|NO|REF|AED|FT|IPP)\s*.*$",
+                       "", c, flags=re.IGNORECASE).strip()
             if len(c) >= 4 and not c.replace(" ", "").isdigit():
                 return c
-    return description
+    return desc
 
 
-# ---------------------------------------------------------------------------
-# Core: match one EFT row against all statement rows of all cards
-# ---------------------------------------------------------------------------
-
-def _score_eft_vs_stmt_row(
-    remitter: str,
-    description: str,
-    eft_amount: Optional[float],
-    eft_date: Optional[str],
-    card_name: str,
-    stmt_row: Dict[str, Any],
-) -> float:
-    """Return weighted total score (0-100) for one EFT ↔ statement-row pair."""
-    # Name: compare remitter (and full description) against card name
-    ns = max(
-        name_similarity(remitter, card_name),
-        name_similarity(description, card_name),
-    )
-    # Amount: EFT amount vs statement row original_amount
-    as_ = amount_score(eft_amount, stmt_row.get("original_amount"))
-    # Date: EFT transfer_date vs statement row posting_date
-    ds = date_score(eft_date, stmt_row.get("posting_date"))
-
-    return round(ns * 0.50 + as_ * 0.30 + ds * 0.20, 1)
+def _extract_doc_nos(desc: str) -> List[str]:
+    return [m.upper().replace(" ", "") for m in _DOC_PATTERN.findall(desc)]
 
 
-def reconcile_eft_to_statement_rows(
-    eft_items: List[Dict[str, Any]],
-    customer_cards: List[Dict[str, Any]],
-    min_score: float = 30.0,
-) -> List[Dict[str, Any]]:
+def _parse_bank_fields(desc: str) -> Dict[str, Any]:
+    """Parse structured fields from a bank description string."""
+    out: Dict[str, Any] = {}
+    for key, pat in [
+        ("value_date",   r"Value Date[:\s]+([0-9\-/]+)"),
+        ("currency",     r"Trf Ccy[:\s]+([A-Z]{3})"),
+        ("trf_amount",   r"Trf Amt[:\s]+([\d,\.]+)"),
+        ("pay_details",  r"Pay Dtls[:\s]+([^,]+)"),
+        ("purpose_code", r"POP[:\s]+([A-Z]+)"),
+        ("ord_inst",     r"Ord Inst[:\s]+([^,\n]+)"),
+        ("sender",       r"Sender[:\s]+([A-Z0-9]+)"),
+        ("ipp_ref",      r"IPP Ref[:\s]+([A-Z0-9]+)"),
+    ]:
+        m = re.search(pat, desc, re.IGNORECASE)
+        if m: out[key] = m.group(1).strip()
+    return out
+
+
+def _is_processor(remitter: str) -> bool:
+    n = _norm(remitter)
+    return any(_norm(kw) in n for kw in PROCESSOR_KEYWORDS)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TABLE BUILDERS  (MongoDB upsert-based)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def build_bank_transactions(db: Any) -> None:
     """
-    For every EFT item find the best-matching (card, statement_row) pair.
-
-    Returns list of result dicts, one per EFT item:
-      eft_item, remitter, transfer_date, amount,
-      status (matched/partial/unmatched),
-      matched_card_id, matched_card_name,
-      matched_stmt_row,
-      name_score, amount_score, date_score, total_score,
-      all_candidates (top-3)
+    Read eft_payments → upsert into bank_transactions.
+    Idempotent: existing rows are updated, new rows inserted.
     """
-    # Build flat list of (card_meta, stmt_row) pairs
-    pairs: List[Dict[str, Any]] = []
-    for card_doc in customer_cards:
-        card = card_doc.get("customer_card") or {}
-        card_meta = {
-            "_id": str(card_doc.get("_id", "")),
-            "customer_id": card.get("customer_id"),
-            "customer_name": card.get("customer_name", ""),
-            "source_file_path": card_doc.get("source_file_path"),
-        }
-        rows = card.get("statement_rows") or []
-        if rows:
-            for row in rows:
-                pairs.append({"card": card_meta, "row": row})
-        else:
-            # Card has no statement rows — still allow name-only match
-            pairs.append({"card": card_meta, "row": {}})
+    coll = db["bank_transactions"]
+    coll.create_index("source_id", unique=True, sparse=True)
 
-    results: List[Dict[str, Any]] = []
+    for eft_doc in db["eft_payments"].find():
+        eft = eft_doc.get("eft_payment", {})
+        eft_ref = eft.get("eft_reference", str(eft_doc["_id"]))
 
-    for item in eft_items:
-        description  = item.get("description", "") or ""
-        eft_amount   = item.get("amount")
-        transfer_date = item.get("transfer_date", "")
-        remitter     = extract_remitter(description)
+        for idx, item in enumerate(eft.get("items", [])):
+            source_id = f"{eft_ref}::{idx}"
+            desc = item.get("description", "") or ""
+            parsed = _parse_bank_fields(desc)
+            remitter = _extract_remitter(desc)
+            candidate_docs = _extract_doc_nos(desc)
+            amount = _amt(item.get("amount"))
 
-        candidates = []
-        for pair in pairs:
-            card_meta = pair["card"]
-            stmt_row  = pair["row"]
-            score = _score_eft_vs_stmt_row(
-                remitter, description, eft_amount, transfer_date,
-                card_meta["customer_name"], stmt_row,
-            )
-            candidates.append({
-                "card": card_meta,
-                "stmt_row": stmt_row,
-                "name_score": round(max(
-                    name_similarity(remitter, card_meta["customer_name"]),
-                    name_similarity(description, card_meta["customer_name"]),
-                ), 1),
-                "amount_score": round(amount_score(eft_amount, stmt_row.get("original_amount")), 1),
-                "date_score": round(date_score(transfer_date, stmt_row.get("posting_date")), 1),
-                "total_score": score,
-            })
+            existing = coll.find_one({"source_id": source_id})
+            if existing:
+                # Never overwrite match-tracking fields on re-run
+                coll.update_one({"source_id": source_id}, {"$set": {
+                    "txn_date": item.get("transfer_date"),
+                    "bank_name": item.get("bank_name"),
+                    "raw_description": desc,
+                    "remitter_name": remitter,
+                    "sender_bank": parsed.get("sender"),
+                    "value_date": parsed.get("value_date"),
+                    "currency": parsed.get("currency", "AED"),
+                    "amount": amount,
+                    "pay_details": parsed.get("pay_details"),
+                    "purpose_code": parsed.get("purpose_code"),
+                    "ordering_institution": parsed.get("ord_inst"),
+                    "candidate_doc_nos": candidate_docs,
+                    "is_processor": _is_processor(remitter),
+                    "eft_reference": eft_ref,
+                }})
+            else:
+                coll.insert_one({
+                    "source_id": source_id,
+                    "txn_date": item.get("transfer_date"),
+                    "bank_name": item.get("bank_name"),
+                    "raw_description": desc,
+                    "remitter_name": remitter,
+                    "sender_bank": parsed.get("sender"),
+                    "value_date": parsed.get("value_date"),
+                    "currency": parsed.get("currency", "AED"),
+                    "amount": amount,
+                    "pay_details": parsed.get("pay_details"),
+                    "purpose_code": parsed.get("purpose_code"),
+                    "ordering_institution": parsed.get("ord_inst"),
+                    "candidate_doc_nos": candidate_docs,
+                    "is_processor": _is_processor(remitter),
+                    "eft_reference": eft_ref,
+                    # match-tracking
+                    "matched_flag": False,
+                    "matched_customer": None,
+                    "matched_doc_nos": [],
+                    "matched_amount": 0.0,
+                    "unallocated_amount": amount,
+                    "match_method": None,
+                })
 
-        candidates.sort(key=lambda x: x["total_score"], reverse=True)
-        top  = candidates[0] if candidates else None
-        top3 = candidates[:3]
+    print(f"  bank_transactions: {coll.count_documents({})} rows")
 
-        # Both name AND amount must individually clear their thresholds
-        name_ok   = top["name_score"]   > 40.0 if top else False
-        amount_ok = top["amount_score"] > 20.0 if top else False
 
-        if top and name_ok and amount_ok and top["total_score"] >= min_score:
-            status = "matched"
-        elif top and (name_ok or amount_ok) and top["total_score"] >= 25:
-            status = "partial"
-        else:
-            status = "unmatched"
+def build_customer_open_items(db: Any) -> None:
+    """
+    Read customer_cards statement_rows → upsert into customer_open_items.
+    Only rows with remaining_amount != 0 are considered open.
+    """
+    coll = db["customer_open_items"]
+    coll.create_index("source_id", unique=True, sparse=True)
+    coll.create_index("doc_no")
+    coll.create_index("customer_name_norm")
 
-        results.append({
-            "eft_item": item,
-            "remitter": remitter,
-            "transfer_date": transfer_date,
-            "amount": eft_amount,
-            "status": status,
-            "matched_card_id": top["card"]["_id"] if top else None,
-            "matched_card_name": top["card"]["customer_name"] if top else None,
-            "matched_stmt_row": top["stmt_row"] if (top and status == "matched") else None,
-            "name_score": top["name_score"] if top else 0,
-            "amount_score": top["amount_score"] if top else 0,
-            "date_score": top["date_score"] if top else 0,
-            "total_score": top["total_score"] if top else 0,
-            "all_candidates": [
-                {
-                    "customer_name": c["card"]["customer_name"],
-                    "customer_id": c["card"]["customer_id"],
-                    "stmt_row": c["stmt_row"],
-                    "name_score": c["name_score"],
-                    "amount_score": c["amount_score"],
-                    "date_score": c["date_score"],
-                    "total_score": c["total_score"],
-                }
-                for c in top3
-            ],
+    for card_doc in db["customer_cards"].find():
+        card = card_doc.get("customer_card", {})
+        customer_name = card.get("customer_name", "Unknown")
+        customer_code = card.get("customer_id")
+        card_id = str(card_doc["_id"])
+
+        for idx, row in enumerate(card.get("statement_rows", [])):
+            rem = _amt(row.get("remaining_amount"))
+            if rem == 0:
+                continue  # already cleared
+
+            source_id = f"{card_id}::{idx}"
+            existing = coll.find_one({"source_id": source_id})
+
+            base = {
+                "customer_name": customer_name,
+                "customer_name_norm": _norm(customer_name),
+                "customer_code": customer_code,
+                "card_id": card_id,
+                "posting_date": row.get("posting_date"),
+                "doc_no": (row.get("document_no") or "").upper().strip(),
+                "lpo": row.get("lpo"),
+                "sell_to_customer_name": row.get("sell_to_customer_name"),
+                "original_amount": _amt(row.get("original_amount")),
+                "currency": "AED",
+            }
+
+            if existing:
+                # Only refresh static fields; never overwrite cleared_flag / remaining_amount
+                coll.update_one({"source_id": source_id}, {"$set": base})
+            else:
+                coll.insert_one({
+                    **base,
+                    "source_id": source_id,
+                    "remaining_amount": rem,
+                    # match-tracking
+                    "cleared_flag": False,
+                    "cleared_by_bank_ids": [],
+                })
+
+    print(f"  customer_open_items: {coll.count_documents({})} rows "
+          f"({coll.count_documents({'cleared_flag': False})} open)")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ALLOCATION HELPER
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _allocate(db: Any, bank_id: str, invoice_ids: List[str],
+              amounts: List[float], method: str,
+              customer_name: str, doc_nos: List[str]) -> None:
+    """
+    Apply one allocation: update bank_transactions + customer_open_items
+    and write an audit record to recon_matched_pairs.
+    """
+    bt = db["bank_transactions"]
+    oi = db["customer_open_items"]
+    pairs = db["recon_matched_pairs"]
+
+    total_alloc = sum(amounts)
+
+    # Update bank row
+    bt.update_one({"_id": ObjectId(bank_id)}, {"$inc": {
+        "matched_amount": total_alloc,
+        "unallocated_amount": -total_alloc,
+    }, "$set": {
+        "matched_customer": customer_name,
+        "match_method": method,
+    }, "$addToSet": {
+        "matched_doc_nos": {"$each": doc_nos},
+    }})
+    # Set matched_flag if fully consumed
+    row = bt.find_one({"_id": ObjectId(bank_id)})
+    if row and row.get("unallocated_amount", 0) <= AMOUNT_TOL:
+        bt.update_one({"_id": ObjectId(bank_id)}, {"$set": {"matched_flag": True}})
+
+    # Update each invoice
+    for inv_id, alloc_amt, doc_no in zip(invoice_ids, amounts, doc_nos):
+        oi.update_one({"_id": ObjectId(inv_id)}, {
+            "$inc": {"remaining_amount": -alloc_amt},
+            "$addToSet": {"cleared_by_bank_ids": bank_id},
         })
+        inv = oi.find_one({"_id": ObjectId(inv_id)})
+        if inv and abs(inv.get("remaining_amount", 0)) <= AMOUNT_TOL:
+            oi.update_one({"_id": ObjectId(inv_id)}, {"$set": {"cleared_flag": True}})
 
+    # Audit record
+    pairs.insert_one({
+        "bank_id": bank_id,
+        "invoice_ids": invoice_ids,
+        "doc_nos": doc_nos,
+        "customer_name": customer_name,
+        "allocated_amounts": amounts,
+        "total_allocated": total_alloc,
+        "method": method,
+        "reconciled_at": datetime.now().isoformat(),
+    })
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PASS 1 – Direct invoice-number match
+# ─────────────────────────────────────────────────────────────────────────────
+
+def pass1_doc_no_match(db: Any) -> int:
+    bt = db["bank_transactions"]
+    oi = db["customer_open_items"]
+    matched = 0
+
+    for row in bt.find({"matched_flag": False, "unallocated_amount": {"$gt": AMOUNT_TOL},
+                         "candidate_doc_nos": {"$ne": []}}):
+        bank_id = str(row["_id"])
+        unalloc = row["unallocated_amount"]
+
+        for doc_no in row.get("candidate_doc_nos", []):
+            inv = oi.find_one({"doc_no": doc_no.upper(), "cleared_flag": False,
+                                "remaining_amount": {"$gt": AMOUNT_TOL}})
+            if not inv:
+                continue
+
+            inv_rem = inv["remaining_amount"]
+            alloc = min(unalloc, inv_rem)
+
+            _allocate(db, bank_id, [str(inv["_id"])], [alloc],
+                      "pass1_doc_no", inv["customer_name"], [doc_no])
+            matched += 1
+
+            # Refresh unallocated_amount for next candidate_doc_no
+            row = bt.find_one({"_id": row["_id"]})
+            unalloc = row.get("unallocated_amount", 0)
+            if unalloc <= AMOUNT_TOL:
+                break
+
+    print(f"  Pass 1 (doc_no):  {matched} allocations")
+    return matched
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PASS 2 – Customer name + exact amount
+# ─────────────────────────────────────────────────────────────────────────────
+
+def pass2_name_exact_amount(db: Any) -> int:
+    bt = db["bank_transactions"]
+    oi = db["customer_open_items"]
+    matched = 0
+
+    for row in bt.find({"matched_flag": False, "unallocated_amount": {"$gt": AMOUNT_TOL}}):
+        bank_id = str(row["_id"])
+        unalloc = row["unallocated_amount"]
+        remitter = row.get("remitter_name", "") or row.get("raw_description", "")
+
+        # Find candidate customers by name similarity
+        best_inv = None
+        best_score = 0.0
+
+        for inv in oi.find({"cleared_flag": False, "remaining_amount": {"$gt": AMOUNT_TOL}}):
+            score = name_sim(remitter, inv["customer_name"])
+            if score < NAME_THRESH:
+                continue
+            # Amount must match within tolerance
+            if abs(inv["remaining_amount"] - unalloc) <= AMOUNT_TOL:
+                if score > best_score:
+                    best_score = score
+                    best_inv = inv
+
+        if best_inv:
+            alloc = min(unalloc, best_inv["remaining_amount"])
+            _allocate(db, bank_id, [str(best_inv["_id"])], [alloc],
+                      "pass2_name_exact", best_inv["customer_name"],
+                      [best_inv["doc_no"]])
+            matched += 1
+
+    print(f"  Pass 2 (name+exact): {matched} allocations")
+    return matched
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PASS 3 – Customer name + combination of invoices
+# ─────────────────────────────────────────────────────────────────────────────
+
+def pass3_name_combo(db: Any) -> int:
+    bt = db["bank_transactions"]
+    oi = db["customer_open_items"]
+    matched = 0
+
+    for row in bt.find({"matched_flag": False, "unallocated_amount": {"$gt": AMOUNT_TOL}}):
+        bank_id = str(row["_id"])
+        unalloc = row["unallocated_amount"]
+        remitter = row.get("remitter_name", "") or row.get("raw_description", "")
+
+        # Group open invoices by customer, keep only name-similar ones
+        customer_invoices: Dict[str, List[Dict]] = {}
+        for inv in oi.find({"cleared_flag": False, "remaining_amount": {"$gt": AMOUNT_TOL}}):
+            score = name_sim(remitter, inv["customer_name"])
+            if score < NAME_THRESH:
+                continue
+            cn = inv["customer_name"]
+            customer_invoices.setdefault(cn, []).append(inv)
+
+        found = False
+        for cn, invs in customer_invoices.items():
+            # Sort oldest first
+            invs.sort(key=lambda x: _parse_date(x.get("posting_date")) or date.min)
+
+            for size in range(2, min(COMBO_MAX + 1, len(invs) + 1)):
+                for combo in combinations(invs, size):
+                    total = sum(i["remaining_amount"] for i in combo)
+                    if abs(total - unalloc) <= AMOUNT_TOL:
+                        ids    = [str(i["_id"]) for i in combo]
+                        amts   = [i["remaining_amount"] for i in combo]
+                        dnos   = [i["doc_no"] for i in combo]
+                        _allocate(db, bank_id, ids, amts, "pass3_combo", cn, dnos)
+                        matched += 1
+                        found = True
+                        break
+                if found:
+                    break
+            if found:
+                break
+
+    print(f"  Pass 3 (combo):   {matched} allocations")
+    return matched
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PASS 4 – Partial payment (bank < invoice, strong name match)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def pass4_partial(db: Any) -> int:
+    bt = db["bank_transactions"]
+    oi = db["customer_open_items"]
+    matched = 0
+
+    for row in bt.find({"matched_flag": False, "unallocated_amount": {"$gt": AMOUNT_TOL}}):
+        bank_id = str(row["_id"])
+        unalloc = row["unallocated_amount"]
+        remitter = row.get("remitter_name", "") or row.get("raw_description", "")
+
+        best_inv = None
+        best_score = 0.0
+
+        for inv in oi.find({"cleared_flag": False, "remaining_amount": {"$gt": unalloc + AMOUNT_TOL}}):
+            score = name_sim(remitter, inv["customer_name"])
+            if score >= 70.0 and score > best_score:   # high confidence required
+                best_score = score
+                best_inv = inv
+
+        if best_inv:
+            _allocate(db, bank_id, [str(best_inv["_id"])], [unalloc],
+                      "pass4_partial", best_inv["customer_name"],
+                      [best_inv["doc_no"]])
+            matched += 1
+
+    print(f"  Pass 4 (partial): {matched} allocations")
+    return matched
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PASS 5 – Processor / POS settlement
+# ─────────────────────────────────────────────────────────────────────────────
+
+def pass5_processor(db: Any) -> int:
+    bt = db["bank_transactions"]
+    oi = db["customer_open_items"]
+    matched = 0
+
+    for row in bt.find({"matched_flag": False, "is_processor": True,
+                         "unallocated_amount": {"$gt": AMOUNT_TOL}}):
+        bank_id = str(row["_id"])
+        unalloc = row["unallocated_amount"]
+        remitter = row.get("remitter_name", "")
+
+        # Find the processor's own open item (if any) by exact name
+        inv = oi.find_one({
+            "customer_name_norm": _norm(remitter),
+            "cleared_flag": False,
+            "remaining_amount": {"$gt": AMOUNT_TOL},
+        })
+        if inv:
+            alloc = min(unalloc, inv["remaining_amount"])
+            _allocate(db, bank_id, [str(inv["_id"])], [alloc],
+                      "pass5_processor", inv["customer_name"], [inv["doc_no"]])
+            matched += 1
+
+    print(f"  Pass 5 (processor): {matched} allocations")
+    return matched
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MAIN RUNNER
+# ─────────────────────────────────────────────────────────────────────────────
+
+def run_dhofar_reconciliation(db: Any) -> Dict[str, Any]:
+    """Build tables, run all passes, return summary."""
+    print("Building BankTransactions …")
+    build_bank_transactions(db)
+    print("Building CustomerOpenItems …")
+    build_customer_open_items(db)
+
+    print("\nRunning matching passes …")
+    p1 = pass1_doc_no_match(db)
+    p2 = pass2_name_exact_amount(db)
+    p3 = pass3_name_combo(db)
+    p4 = pass4_partial(db)
+    p5 = pass5_processor(db)
+
+    bt = db["bank_transactions"]
+    oi = db["customer_open_items"]
+
+    total_bank   = bt.count_documents({})
+    matched_bank = bt.count_documents({"matched_flag": True})
+    total_inv    = oi.count_documents({})
+    cleared_inv  = oi.count_documents({"cleared_flag": True})
+
+    matched_amt  = sum(r.get("matched_amount", 0) for r in bt.find({"matched_flag": True}))
+    unmatched_amt= sum(r.get("unallocated_amount", 0) for r in bt.find({"matched_flag": False}))
+
+    summary = {
+        "bank_rows_total": total_bank,
+        "bank_rows_matched": matched_bank,
+        "bank_rows_unmatched": total_bank - matched_bank,
+        "invoices_total": total_inv,
+        "invoices_cleared": cleared_inv,
+        "invoices_open": total_inv - cleared_inv,
+        "matched_amount": round(matched_amt, 2),
+        "unmatched_amount": round(unmatched_amt, 2),
+        "pass_counts": {"p1": p1, "p2": p2, "p3": p3, "p4": p4, "p5": p5},
+    }
+    print(f"\nSummary: {summary}")
+    return summary
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# VIEW HELPERS  (used by API)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _ser(doc: Dict) -> Dict:
+    doc = dict(doc)
+    if "_id" in doc and isinstance(doc["_id"], ObjectId):
+        doc["_id"] = str(doc["_id"])
+    return doc
+
+
+def get_matched_pairs(db: Any) -> List[Dict]:
+    """View (a): matched bank rows with their linked invoices."""
+    bt = db["bank_transactions"]
+    oi = db["customer_open_items"]
+    pairs = db["recon_matched_pairs"]
+
+    results = []
+    for row in bt.find({"matched_flag": True}).sort("txn_date", 1):
+        row = _ser(row)
+        bank_id = row["_id"]
+        linked = list(pairs.find({"bank_id": bank_id}))
+        inv_ids = []
+        for p in linked:
+            inv_ids.extend(p.get("invoice_ids", []))
+        invoices = [_ser(i) for i in oi.find({"_id": {"$in": [ObjectId(i) for i in inv_ids]}})]
+        results.append({"bank_row": row, "invoices": invoices, "pairs": [_ser(p) for p in linked]})
     return results
 
 
-# ---------------------------------------------------------------------------
-# Store & retrieve
-# ---------------------------------------------------------------------------
+def get_unmatched_bank(db: Any) -> List[Dict]:
+    """View (b): bank rows still needing investigation."""
+    return [_ser(r) for r in
+            db["bank_transactions"].find({"matched_flag": False}).sort("txn_date", 1)]
 
-def store_dhofar_reconciliation(
-    results: List[Dict[str, Any]],
-    eft_reference: str,
-    db: Any,
-) -> None:
-    coll = db["dhofar_reconciliation_results"]
-    coll.create_index("eft_reference")
-    coll.create_index("status")
-    coll.create_index("matched_card_id")
 
-    coll.delete_many({"eft_reference": eft_reference})
+def get_unmatched_invoices(db: Any) -> List[Dict]:
+    """View (c): open invoices not yet reconciled."""
+    return [_ser(r) for r in
+            db["customer_open_items"].find({"cleared_flag": False}).sort("posting_date", 1)]
 
-    docs = []
-    for r in results:
-        docs.append({
-            "eft_reference": eft_reference,
-            "reconciled_at": datetime.now().isoformat(),
-            **{k: v for k, v in r.items()},
+
+def get_reconciliation_for_card(card_id: str, db: Any) -> List[Dict]:
+    """Return matched bank rows for a specific customer card (for UI tab)."""
+    oi = db["customer_open_items"]
+    bt = db["bank_transactions"]
+    pairs = db["recon_matched_pairs"]
+
+    inv_ids = [str(i["_id"]) for i in oi.find({"card_id": card_id})]
+    if not inv_ids:
+        return []
+
+    bank_ids = set()
+    for p in pairs.find({"invoice_ids": {"$in": inv_ids}}):
+        bank_ids.add(p["bank_id"])
+
+    results = []
+    for bid in bank_ids:
+        try:
+            row = bt.find_one({"_id": ObjectId(bid)})
+        except Exception:
+            continue
+        if not row:
+            continue
+        row = _ser(row)
+        linked_pairs = [_ser(p) for p in pairs.find({"bank_id": bid, "invoice_ids": {"$in": inv_ids}})]
+        results.append({
+            "bank_row": row,
+            "pairs": linked_pairs,
+            "transfer_date": row.get("txn_date"),
+            "remitter": row.get("remitter_name"),
+            "amount": row.get("amount"),
+            "matched_amount": row.get("matched_amount"),
+            "matched_doc_nos": row.get("matched_doc_nos", []),
+            "match_method": row.get("match_method"),
+            "status": "matched" if row.get("matched_flag") else "partial",
+            "total_score": 100 if row.get("matched_flag") else 60,
         })
-    if docs:
-        coll.insert_many(docs)
-    print(f"  Stored {len(docs)} reconciliation records for EFT {eft_reference}")
+    results.sort(key=lambda x: x.get("amount", 0), reverse=True)
+    return results
 
 
-def get_reconciliation_results(db: Any) -> List[Dict[str, Any]]:
-    coll = db["dhofar_reconciliation_results"]
-    docs = list(coll.find().sort("total_score", -1))
-    for doc in docs:
-        if "_id" in doc and isinstance(doc["_id"], ObjectId):
-            doc["_id"] = str(doc["_id"])
-    return docs
-
-
-def get_reconciliation_for_card(card_id: str, db: Any) -> List[Dict[str, Any]]:
-    """Return all matched/partial EFT rows for a specific customer card."""
-    coll = db["dhofar_reconciliation_results"]
-    docs = list(
-        coll.find(
-            {"matched_card_id": card_id, "status": {"$in": ["matched", "partial"]}},
-        ).sort("total_score", -1)
-    )
-    for doc in docs:
-        if "_id" in doc and isinstance(doc["_id"], ObjectId):
-            doc["_id"] = str(doc["_id"])
-    return docs
-
-
-# ---------------------------------------------------------------------------
-# Summary
-# ---------------------------------------------------------------------------
-
-def build_summary(results: List[Dict[str, Any]]) -> Dict[str, Any]:
-    matched   = [r for r in results if r["status"] == "matched"]
-    partial   = [r for r in results if r["status"] == "partial"]
-    unmatched = [r for r in results if r["status"] == "unmatched"]
-    total_amt = sum(r["amount"] or 0 for r in results)
-    return {
-        "total_items": len(results),
-        "matched": len(matched),
-        "partial": len(partial),
-        "unmatched": len(unmatched),
-        "matched_amount": round(sum(r["amount"] or 0 for r in matched), 2),
-        "partial_amount": round(sum(r["amount"] or 0 for r in partial), 2),
-        "unmatched_amount": round(sum(r["amount"] or 0 for r in unmatched), 2),
-        "total_amount": round(total_amt, 2),
-        "match_rate_pct": round(len(matched) / len(results) * 100, 1) if results else 0,
-    }
-
-
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
-
-def run_dhofar_reconciliation(db: Any) -> Dict[str, Any]:
-    cards = list(db["customer_cards"].find())
-    efts  = list(db["eft_payments"].find())
-
-    if not cards:
-        return {"error": "No customer cards found."}
-    if not efts:
-        return {"error": "No EFT payments found."}
-
-    all_results: List[Dict[str, Any]] = []
-    for eft_doc in efts:
-        eft_data  = eft_doc.get("eft_payment", {})
-        eft_ref   = eft_data.get("eft_reference", str(eft_doc.get("_id", "")))
-        eft_items = eft_data.get("items", [])
-        print(f"Reconciling EFT {eft_ref}: {len(eft_items)} items vs {len(cards)} cards...")
-        results = reconcile_eft_to_statement_rows(eft_items, cards)
-        store_dhofar_reconciliation(results, eft_ref, db)
-        all_results.extend(results)
-
-    summary = build_summary(all_results)
-    print(f"Summary: {summary}")
-    return summary
-
+# ─────────────────────────────────────────────────────────────────────────────
+# CLI
+# ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     client = make_mongo_client(MONGO_URI)
     require_mongo_auth(client)
     db = client[MONGO_DB]
     summary = run_dhofar_reconciliation(db)
+
     print("\n=== RECONCILIATION COMPLETE ===")
-    for k, v in summary.items():
-        print(f"  {k}: {v}")
+    print(f"  Bank rows   : {summary['bank_rows_matched']}/{summary['bank_rows_total']} matched")
+    print(f"  Invoices    : {summary['invoices_cleared']}/{summary['invoices_total']} cleared")
+    print(f"  Matched AED : {summary['matched_amount']:,.2f}")
+    print(f"  Unmatched   : {summary['unmatched_amount']:,.2f}")
+    print(f"  Passes      : {summary['pass_counts']}")
+
+    print("\n--- UNMATCHED BANK ROWS ---")
+    for r in get_unmatched_bank(db):
+        print(f"  {r['txn_date']} | AED {r['amount']:>10,.2f} | {r['remitter_name'][:50]}")
+
+    print("\n--- UNMATCHED INVOICES ---")
+    for r in get_unmatched_invoices(db):
+        print(f"  {r['posting_date']} | {r['doc_no']:20} | AED {r['remaining_amount']:>10,.2f} | {r['customer_name'][:40]}")

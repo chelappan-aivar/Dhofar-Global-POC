@@ -1,4 +1,18 @@
-"""Shared MongoClient TLS options for Atlas and strict networks."""
+"""Shared MongoClient factory with robust TLS defaults for MongoDB Atlas.
+
+``TLSV1_ALERT_INTERNAL_ERROR`` root causes and fixes
+=====================================================
+1. **Atlas Network Access** – add your current IP (or ``0.0.0.0/0`` for dev only).
+2. **VPN / corporate SSL inspection** – disconnect VPN or try another network.
+3. **Stale / missing CA bundle** – fixed here by always using ``certifi``.
+   Do **not** set ``MONGO_TLS_USE_SYSTEM_CA=1`` on macOS: PyOpenSSL does not read
+   the macOS Keychain and its fallback paths are usually empty, causing the server
+   to send ``TLSV1_ALERT_INTERNAL_ERROR``.
+4. **Missing PyOpenSSL stack** – run ``pip install -r requirements.txt`` so
+   ``cryptography``, ``pyopenssl``, ``service-identity``, and ``requests`` are
+   present (PyMongo uses PyOpenSSL for TLS when they are all installed).
+5. **Outdated certifi** – run ``pip install -U certifi``.
+"""
 
 from __future__ import annotations
 
@@ -18,41 +32,37 @@ def load_repo_root_env() -> None:
     load_dotenv(root / ".env")
 
 
+def _bool_env(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in ("1", "true", "yes")
+
+
 def mongo_client_kwargs(mongo_uri: str) -> Dict[str, object]:
     """Keyword arguments for :class:`pymongo.mongo_client.MongoClient`.
 
-    For ``mongodb+srv://`` (Atlas), OCSP endpoint checks are turned off by default
-    unless ``MONGO_TLS_STRICT_OCSP=1``. Some networks block OCSP and cause TLS
-    handshake failures.
+    **CA certificates**
+    ``certifi`` is always used as the TLS CA bundle.  It contains the correct
+    Mozilla root certificates (DigiCert / ISRG) that MongoDB Atlas uses, and it
+    works identically with both Python's stdlib ``ssl`` and the PyOpenSSL stack.
 
-    Set ``MONGO_TLS_USE_SYSTEM_CA=1`` to omit ``tlsCAFile`` and use the OS CA
-    store (e.g. macOS Keychain) instead of certifi.
+    ``MONGO_TLS_USE_SYSTEM_CA=1`` is intentionally *ignored* on macOS because
+    PyOpenSSL calls ``set_default_verify_paths()`` which looks in OpenSSL's
+    compiled-in paths (e.g. ``/usr/local/etc/openssl``), **not** the macOS
+    Keychain, and those paths are usually empty — causing the server to reply
+    with ``TLSV1_ALERT_INTERNAL_ERROR``.
 
-    Set ``MONGO_TLS_DISABLE_OCSP=1`` to force OCSP checks off for any URI.
+    **OCSP**
+    OCSP endpoint checks are disabled for ``mongodb+srv://`` URIs by default.
+    Some networks (VPN, corporate proxy) block the OCSP URL and stall the
+    handshake.  Set ``MONGO_TLS_STRICT_OCSP=1`` to re-enable them.
     """
     kw: Dict[str, object] = {}
-    use_system_ca = os.getenv("MONGO_TLS_USE_SYSTEM_CA", "").strip().lower() in (
-        "1",
-        "true",
-        "yes",
-    )
-    if not use_system_ca:
-        kw["tlsCAFile"] = certifi.where()
 
-    strict_ocsp = os.getenv("MONGO_TLS_STRICT_OCSP", "").strip().lower() in (
-        "1",
-        "true",
-        "yes",
-    )
-    force_disable_ocsp = os.getenv("MONGO_TLS_DISABLE_OCSP", "").strip().lower() in (
-        "1",
-        "true",
-        "yes",
-    )
-    if strict_ocsp:
-        pass
-    elif force_disable_ocsp or mongo_uri.startswith("mongodb+srv://"):
+    # Always use certifi — see docstring above for why MONGO_TLS_USE_SYSTEM_CA is skipped.
+    kw["tlsCAFile"] = certifi.where()
+
+    if not _bool_env("MONGO_TLS_STRICT_OCSP"):
         kw["tlsDisableOCSPEndpointCheck"] = True
+
     return kw
 
 
@@ -75,6 +85,8 @@ def mongo_credentials_from_env() -> tuple[str | None, str | None]:
 def make_mongo_client(mongo_uri: str) -> MongoClient:
     """Build a :class:`~pymongo.mongo_client.MongoClient` with shared TLS options."""
     kw = mongo_client_kwargs(mongo_uri)
+    # Short timeout so startup never hangs if Atlas is temporarily unreachable
+    kw.setdefault("serverSelectionTimeoutMS", 5000)
     user, password = mongo_credentials_from_env()
     if user is not None and password is not None:
         return MongoClient(mongo_uri, username=user, password=password, **kw)

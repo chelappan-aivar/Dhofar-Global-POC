@@ -75,6 +75,7 @@ uvicorn app:app --host 0.0.0.0 --port 8080 --reload
 ```
 
 Open:
+- `http://0.0.0.0:8080/`
 - `http://localhost:8080`
 
 ---

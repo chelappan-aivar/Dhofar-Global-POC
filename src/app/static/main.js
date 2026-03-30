@@ -55,8 +55,7 @@ async function fetchJSON(url) {
     if (!res.ok) throw new Error(`API Error: ${res.status}`);
     return await res.json();
   } catch (e) {
-    console.error("Fetch failed", e);
-    renderEmptyState("list-panel", `Connection Error: ${e.message}`);
+    console.error("Fetch failed", url, e);
     return [];
   }
 }
@@ -2211,18 +2210,6 @@ window.handleSearch = (searchTerm) => {
   
   // Route to appropriate filter function based on current view
   switch(currentView) {
-    case 'recon':
-      filterReconciliation(term);
-      break;
-    case 'invoice':
-      filterInvoices(term);
-      break;
-    case 'po':
-      filterPOs(term);
-      break;
-    case 'grn':
-      filterGRNs(term);
-      break;
     case 'customer_cards':
       filterCustomerCards(term);
       break;
@@ -2319,18 +2306,13 @@ window.triggerNav = (type) => {
   currentView = type;
   
   // Show/hide search bar based on view type
-  const searchableViews = ['recon', 'invoice', 'po', 'grn', 'customer_cards', 'eft_payments', 'dhofar_recon'];
+  const searchableViews = ['customer_cards', 'eft_payments', 'dhofar_recon'];
   const searchBar = document.getElementById('search-bar');
   const searchInput = document.getElementById('search-input');
   
   if (searchableViews.includes(type)) {
     searchBar.classList.remove('hidden');
-    // Update placeholder based on view
     const placeholders = {
-      'recon': 'Search by PO number or vendor...',
-      'invoice': 'Search by invoice number, PO, or vendor...',
-      'po': 'Search by PO number, vendor, or buyer...',
-      'grn': 'Search by GRN number, PO, or vendor...',
       'customer_cards': 'Search by customer name or ID...',
       'eft_payments': 'Search by reference or date...',
       'dhofar_recon': 'Search by remitter or customer name...',
@@ -2345,12 +2327,6 @@ window.triggerNav = (type) => {
   document.getElementById('clear-search-btn').classList.add('hidden');
 
   // Route
-  if (type === 'recon') renderRecon();
-  if (type === 'po') renderPO();
-  if (type === 'grn') renderGRN();
-  if (type === 'invoice') renderInvoices();
-  if (type === 'vendors') renderVendors();
-  if (type === 'buyers') renderBuyers();
   if (type === 'customer_cards') renderCustomerCards();
   if (type === 'eft_payments') renderEFTPayments();
   if (type === 'dhofar_recon') renderDhofarReconciliation();
@@ -2358,8 +2334,7 @@ window.triggerNav = (type) => {
 
 // Initialize app
 window.addEventListener("DOMContentLoaded", async () => {
-  await loadCurrencyRates(); // Load currency rates first
-  triggerNav('recon'); // Default View
+  triggerNav('dhofar_recon'); // Default View
   setupDropZone(); // Setup drag and drop
 });
 
@@ -2641,19 +2616,8 @@ window.uploadFile = async () => {
         triggerNav('eft_payments');
         triggerDhofarRecon();
       } else {
-        // Default: navigate to reconciliation for PO uploads
-        const firstSuccessfulPO = results.find(r =>
-          r.success &&
-          r.result.document_type === 'purchase_order' &&
-          r.result.document_id
-        );
-        if (firstSuccessfulPO) {
-          triggerNav('recon');
-          setTimeout(() => renderRecon(firstSuccessfulPO.result.document_id), 500);
-        } else {
-          const activeNav = document.querySelector('.nav-item.active');
-          if (activeNav) triggerNav(activeNav.id.replace('nav-', ''));
-        }
+        const activeNav = document.querySelector('.nav-item.active');
+        if (activeNav) triggerNav(activeNav.id.replace('nav-', ''));
       }
     }, 2000);
   } else {
@@ -2704,18 +2668,28 @@ async function renderCustomerCards() {
   document.getElementById('search-bar').classList.remove('hidden');
   renderEmptyState("list-content", "Loading customer cards...");
 
-  // Show upload button in analytics bar
   const bar = document.getElementById('analytics-bar');
   bar.classList.remove('hidden');
   bar.innerHTML = `
     <div class="flex items-center justify-between w-full">
-      <span class="text-xs text-gray-500">Customer account statements from Dhofar Global</span>
+      <div class="flex items-center gap-3">
+        <label class="flex items-center gap-2 cursor-pointer text-xs text-gray-600 font-semibold select-none">
+          <input type="checkbox" id="select-all-cards" onchange="toggleSelectAll('customer_cards', this.checked)"
+            class="w-4 h-4 rounded border-gray-300 text-indigo-600 cursor-pointer">
+          Select All
+        </label>
+        <button id="bulk-delete-cards" onclick="deleteSelected('customer_cards')"
+          class="hidden items-center gap-1.5 px-3 py-1.5 bg-red-600 hover:bg-red-700 text-white rounded-lg text-xs font-semibold transition-all shadow-sm">
+          <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg>
+          Delete Selected (<span id="selected-count-cards">0</span>)
+        </button>
+      </div>
       <button onclick="openUploadModal('customer_card')"
         class="inline-flex items-center gap-2 px-3 py-1.5 bg-amber-600 hover:bg-amber-700 text-white rounded-lg text-xs font-semibold transition-all shadow-sm">
         <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
           <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"></path>
         </svg>
-        Upload Customer Card
+        Upload Files
       </button>
     </div>
   `;
@@ -2728,7 +2702,7 @@ async function renderCustomerCards() {
     <div class="p-6 text-center">
       <p class="text-sm text-gray-500 mb-4">No customer cards found.</p>
       <button onclick="openUploadModal('customer_card')" class="px-4 py-2 bg-amber-600 hover:bg-amber-700 text-white rounded-lg text-sm font-semibold">
-        Upload Customer Card
+        Upload Files
       </button>
     </div>`);
   renderCustomerCardsList(data);
@@ -2744,13 +2718,20 @@ function renderCustomerCardsList(data) {
     const totalBal = card.total_balance;
 
     return `
-      <div class="list-item group p-4 border-b border-gray-100 hover:bg-gray-50 cursor-pointer border-l-4 border-l-transparent transition-all duration-200" data-index="${idx}">
+      <div class="list-item group p-4 border-b border-gray-100 hover:bg-gray-50 cursor-pointer border-l-4 border-l-transparent transition-all duration-200" data-index="${idx}" data-id="${d._id}" data-type="customer_cards">
         <div class="flex items-center gap-3 mb-2">
+          <input type="checkbox" class="item-checkbox w-4 h-4 rounded border-gray-300 text-indigo-600 cursor-pointer flex-shrink-0"
+            data-id="${d._id}" data-type="customer_cards"
+            onclick="event.stopPropagation(); updateBulkBar('customer_cards')" />
           <div class="w-9 h-9 rounded-lg bg-gradient-to-br from-amber-500 to-orange-600 flex items-center justify-center text-white font-bold text-sm flex-shrink-0">${initial}</div>
           <div class="flex-1 min-w-0">
             <div class="font-bold text-gray-900 group-hover:text-indigo-600 text-sm truncate">${name}</div>
             <div class="text-[10px] text-gray-500">${card.customer_id || ''}</div>
           </div>
+          <button onclick="event.stopPropagation(); deleteRecord('customer_cards','${d._id}')" 
+            class="opacity-0 group-hover:opacity-100 p-1 text-red-400 hover:text-red-600 hover:bg-red-50 rounded transition-all flex-shrink-0" title="Delete">
+            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg>
+          </button>
         </div>
         <div class="flex justify-between text-[10px] text-gray-500">
           <span>${rows.length} statement row${rows.length !== 1 ? 's' : ''}</span>
@@ -2950,6 +2931,32 @@ async function renderEFTPayments() {
   document.getElementById('search-bar').classList.remove('hidden');
   renderEmptyState("list-content", "Loading EFT payments...");
 
+  const bar = document.getElementById('analytics-bar');
+  bar.classList.remove('hidden');
+  bar.innerHTML = `
+    <div class="flex items-center justify-between w-full">
+      <div class="flex items-center gap-3">
+        <label class="flex items-center gap-2 cursor-pointer text-xs text-gray-600 font-semibold select-none">
+          <input type="checkbox" id="select-all-eft" onchange="toggleSelectAll('eft_payments', this.checked)"
+            class="w-4 h-4 rounded border-gray-300 text-indigo-600 cursor-pointer">
+          Select All
+        </label>
+        <button id="bulk-delete-eft" onclick="deleteSelected('eft_payments')"
+          class="hidden items-center gap-1.5 px-3 py-1.5 bg-red-600 hover:bg-red-700 text-white rounded-lg text-xs font-semibold transition-all shadow-sm">
+          <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg>
+          Delete Selected (<span id="selected-count-eft">0</span>)
+        </button>
+      </div>
+      <button onclick="openUploadModal('eft')"
+        class="inline-flex items-center gap-2 px-3 py-1.5 bg-amber-600 hover:bg-amber-700 text-white rounded-lg text-xs font-semibold transition-all shadow-sm">
+        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"></path>
+        </svg>
+        Upload Files
+      </button>
+    </div>
+  `;
+
   const data = await fetchJSON("/api/eft_payments");
   updateHeader("EFT Payments", data.length);
   window.eftPaymentsData = data;
@@ -2969,10 +2976,21 @@ function renderEFTPaymentsList(data) {
     const itemCount = (eft.items || []).length;
 
     return `
-      <div class="list-item group p-4 border-b border-gray-100 hover:bg-gray-50 cursor-pointer border-l-4 border-l-transparent transition-all duration-200" data-index="${idx}">
+      <div class="list-item group p-4 border-b border-gray-100 hover:bg-gray-50 cursor-pointer border-l-4 border-l-transparent transition-all duration-200" data-index="${idx}" data-id="${d._id}" data-type="eft_payments">
         <div class="flex justify-between items-start mb-2">
-          <span class="font-bold text-gray-900 group-hover:text-indigo-600 text-sm truncate flex-1">${ref}</span>
-          ${total ? `<span class="text-xs font-mono font-bold text-gray-700 ml-2">${currency} ${total.toLocaleString()}</span>` : ''}
+          <div class="flex items-center gap-2 flex-1 min-w-0">
+            <input type="checkbox" class="item-checkbox w-4 h-4 rounded border-gray-300 text-indigo-600 cursor-pointer flex-shrink-0"
+              data-id="${d._id}" data-type="eft_payments"
+              onclick="event.stopPropagation(); updateBulkBar('eft_payments')" />
+            <span class="font-bold text-gray-900 group-hover:text-indigo-600 text-sm truncate">${ref}</span>
+          </div>
+          <div class="flex items-center gap-1 ml-2 flex-shrink-0">
+            ${total ? `<span class="text-xs font-mono font-bold text-gray-700">${currency} ${total.toLocaleString()}</span>` : ''}
+            <button onclick="event.stopPropagation(); deleteRecord('eft_payments','${d._id}')"
+              class="opacity-0 group-hover:opacity-100 p-1 text-red-400 hover:text-red-600 hover:bg-red-50 rounded transition-all" title="Delete">
+              <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg>
+            </button>
+          </div>
         </div>
         <div class="flex justify-between text-[10px] text-gray-500">
           <span>${eft.payment_date || ''}</span>
@@ -3080,22 +3098,28 @@ function filterEFTPayments(term) {
 
 
 // ============================================================
-// DHOFAR EFT RECONCILIATION VIEW
+// DHOFAR EFT RECONCILIATION VIEW  (5-pass engine)
 // ============================================================
 
 async function renderDhofarReconciliation() {
   updateHeader("EFT Reconciliation", "...");
   document.getElementById('search-bar').classList.remove('hidden');
-  renderEmptyState("list-content", "Loading reconciliation...");
+  renderEmptyState("list-content", "Loading...");
 
   const data = await fetchJSON("/api/dhofar/reconciliation");
-  updateHeader("EFT Reconciliation", data.length);
   window.dhofarReconData = data;
 
-  if (!data.length) {
+  const matched   = data.matched   || [];
+  const unmatchedB = data.unmatched_bank || [];
+  const unmatchedI = data.unmatched_invoices || [];
+  const total = matched.length + unmatchedB.length;
+
+  updateHeader("EFT Reconciliation", total);
+
+  if (!total && !unmatchedI.length) {
     document.getElementById("list-content").innerHTML = `
       <div class="p-6 text-center">
-        <p class="text-sm text-gray-500 mb-4">No reconciliation results yet.</p>
+        <p class="text-sm text-gray-500 mb-4">No reconciliation data yet.</p>
         <button onclick="triggerDhofarRecon()" class="px-4 py-2 bg-amber-600 hover:bg-amber-700 text-white rounded-lg text-sm font-semibold">
           Run Reconciliation
         </button>
@@ -3103,9 +3127,485 @@ async function renderDhofarReconciliation() {
     return;
   }
 
-  renderDhofarReconList(data);
-  renderDhofarReconSummary(data);
+  // Build flat array for renderDhofarReconSummary (expects {status, amount, matched_amount})
+  const flatData = [
+    ...matched.map(r => {
+      const row = r.bank_row || {};
+      const isPartial = row.match_method === 'pass4_partial' || (row.unallocated_amount || 0) > 0.05;
+      return {
+        status: isPartial ? 'partial' : 'matched',
+        amount: row.matched_amount || row.amount || 0,
+        total_amount: row.amount || 0,
+      };
+    }),
+    ...unmatchedB.map(r => ({ status: 'unmatched', amount: r.amount || 0, total_amount: r.amount || 0 })),
+  ];
+  renderDhofarReconSummary(flatData);
+  renderDhofarReconTabs(matched, unmatchedB, unmatchedI);
 }
+
+function renderDhofarReconSummary(matched, unmatchedB, unmatchedI) {
+  const matchedAmt  = matched.reduce((s, r) => s + (r.bank_row?.matched_amount || 0), 0);
+  const unmatchedAmt = unmatchedB.reduce((s, r) => s + (r.unallocated_amount || 0), 0);
+  const openInvAmt  = unmatchedI.reduce((s, r) => s + (r.remaining_amount || 0), 0);
+  const total = matched.length + unmatchedB.length;
+  const pct = total > 0 ? Math.round(matched.length / total * 100) : 0;
+
+  const bar = document.getElementById('analytics-bar');
+  bar.classList.remove('hidden');
+  bar.innerHTML = `
+    <div class="flex items-center justify-between gap-4 flex-wrap w-full">
+      <div class="flex items-center gap-5">
+        <div class="text-center">
+          <div class="text-xl font-bold text-green-600">${matched.length}</div>
+          <div class="text-[7.5px] text-gray-500 uppercase font-semibold mt-1">Matched Bank</div>
+        </div>
+        <div class="text-center">
+          <div class="text-xl font-bold text-red-500">${unmatchedB.length}</div>
+          <div class="text-[7.5px] text-gray-500 uppercase font-semibold mt-1">Unmatched Bank</div>
+        </div>
+        <div class="text-center">
+          <div class="text-xl font-bold text-amber-600">${unmatchedI.length}</div>
+          <div class="text-[7.5px] text-gray-500 uppercase font-semibold mt-1">Open Invoices</div>
+        </div>
+        <div class="h-10 w-px bg-gray-300"></div>
+        <div class="text-center">
+          <div class="text-xl font-bold text-indigo-600">${pct}%</div>
+          <div class="text-[7.5px] text-gray-500 uppercase font-semibold mt-1">Match Rate</div>
+        </div>
+      </div>
+      <div class="flex items-center gap-2">
+        <div class="px-3 py-2 bg-green-600 rounded-lg shadow-sm text-center min-w-[100px]">
+          <div class="text-sm font-bold text-white">AED ${matchedAmt.toLocaleString(undefined,{maximumFractionDigits:0})}</div>
+          <div class="text-[8px] text-green-100 uppercase font-bold mt-0.5">Matched</div>
+        </div>
+        <div class="px-3 py-2 bg-red-500 rounded-lg shadow-sm text-center min-w-[100px]">
+          <div class="text-sm font-bold text-white">AED ${unmatchedAmt.toLocaleString(undefined,{maximumFractionDigits:0})}</div>
+          <div class="text-[8px] text-red-100 uppercase font-bold mt-0.5">Unmatched</div>
+        </div>
+        <div class="px-3 py-2 bg-amber-600 rounded-lg shadow-sm text-center min-w-[100px]">
+          <div class="text-sm font-bold text-white">AED ${openInvAmt.toLocaleString(undefined,{maximumFractionDigits:0})}</div>
+          <div class="text-[8px] text-amber-100 uppercase font-bold mt-0.5">Open Invoices</div>
+        </div>
+        <button onclick="triggerDhofarRecon()" class="px-3 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-xs font-semibold shadow-sm">↻ Re-run</button>
+      </div>
+    </div>`;
+}
+
+function renderDhofarReconTabs(matched, unmatchedB, unmatchedI) {
+  const listContent = document.getElementById("list-content");
+
+  const tabBar = `
+    <div class="border-b border-gray-200 bg-white sticky top-0 z-10">
+      <div class="flex">
+        <button onclick="switchReconTab('tab-matched','tab-unbank','tab-uninv',this)"
+          class="recon-tab flex-1 py-2.5 text-[10px] font-bold border-b-2 border-green-600 text-green-700 -mb-px">
+          ✓ Matched (${matched.length})
+        </button>
+        <button onclick="switchReconTab('tab-unbank','tab-matched','tab-uninv',this)"
+          class="recon-tab flex-1 py-2.5 text-[10px] font-bold border-b-2 border-transparent text-gray-500 hover:text-gray-700 -mb-px">
+          ✗ Bank (${unmatchedB.length})
+        </button>
+        <button onclick="switchReconTab('tab-uninv','tab-matched','tab-unbank',this)"
+          class="recon-tab flex-1 py-2.5 text-[10px] font-bold border-b-2 border-transparent text-gray-500 hover:text-gray-700 -mb-px">
+          📄 Invoices (${unmatchedI.length})
+        </button>
+      </div>
+      <!-- Bulk action bar for recon tabs -->
+      <div class="flex items-center gap-3 px-3 py-2 bg-gray-50 border-t border-gray-100">
+        <label class="flex items-center gap-2 cursor-pointer text-[10px] text-gray-600 font-semibold select-none">
+          <input type="checkbox" id="select-all-recon" onchange="toggleSelectAllRecon(this.checked)"
+            class="w-3.5 h-3.5 rounded border-gray-300 text-indigo-600 cursor-pointer">
+          Select All
+        </label>
+        <button id="bulk-delete-recon" onclick="deleteSelectedRecon()"
+          class="hidden items-center gap-1 px-2.5 py-1 bg-red-600 hover:bg-red-700 text-white rounded text-[10px] font-semibold transition-all">
+          <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg>
+          Delete (<span id="selected-count-recon">0</span>)
+        </button>
+      </div>
+    </div>
+    <div id="tab-matched" class="overflow-y-auto">${_buildMatchedList(matched)}</div>
+    <div id="tab-unbank"  class="hidden overflow-y-auto">${_buildUnmatchedBankList(unmatchedB)}</div>
+    <div id="tab-uninv"   class="hidden overflow-y-auto">${_buildUnmatchedInvList(unmatchedI)}</div>`;
+
+  listContent.innerHTML = tabBar;
+
+  // Click handlers for matched rows
+  listContent.querySelectorAll('.recon-matched-row').forEach((el, idx) => {
+    el.addEventListener('click', () => selectMatchedRow(idx, matched));
+  });
+  listContent.querySelectorAll('.recon-unbank-row').forEach((el, idx) => {
+    el.addEventListener('click', () => selectUnmatchedBank(idx, unmatchedB));
+  });
+  listContent.querySelectorAll('.recon-uninv-row').forEach((el, idx) => {
+    el.addEventListener('click', () => selectUnmatchedInv(idx, unmatchedI));
+  });
+
+  if (matched.length > 0) selectMatchedRow(0, matched);
+}
+
+window.switchReconTab = (showId, hide1, hide2, btn) => {
+  ['tab-matched','tab-unbank','tab-uninv'].forEach(id => {
+    document.getElementById(id)?.classList.add('hidden');
+  });
+  document.getElementById(showId)?.classList.remove('hidden');
+  document.querySelectorAll('.recon-tab').forEach(b => {
+    b.classList.remove('border-green-600','text-green-700','border-red-500','text-red-600','border-amber-600','text-amber-700');
+    b.classList.add('border-transparent','text-gray-500');
+  });
+  const colors = {
+    'tab-matched': ['border-green-600','text-green-700'],
+    'tab-unbank':  ['border-red-500','text-red-600'],
+    'tab-uninv':   ['border-amber-600','text-amber-700'],
+  };
+  const c = colors[showId] || ['border-indigo-600','text-indigo-700'];
+  btn.classList.remove('border-transparent','text-gray-500');
+  btn.classList.add(...c);
+};
+
+function _methodBadge(method) {
+  const labels = {
+    pass1_doc_no: { label: 'Doc#', cls: 'bg-green-100 text-green-700' },
+    pass2_name_exact: { label: 'Name+Amt', cls: 'bg-blue-100 text-blue-700' },
+    pass3_combo: { label: 'Combo', cls: 'bg-purple-100 text-purple-700' },
+    pass4_partial: { label: 'Partial', cls: 'bg-amber-100 text-amber-700' },
+    pass5_processor: { label: 'Processor', cls: 'bg-gray-100 text-gray-600' },
+  };
+  const m = labels[method] || { label: method || '?', cls: 'bg-gray-100 text-gray-600' };
+  return `<span class="text-[9px] font-bold px-1.5 py-0.5 rounded ${m.cls}">${m.label}</span>`;
+}
+
+function _buildMatchedList(matched) {
+  if (!matched.length) return '<p class="p-4 text-xs text-gray-400 italic text-center">No matched rows yet.</p>';
+  return matched.map((r, idx) => {
+    const row = r.bank_row || {};
+    const docs = (row.matched_doc_nos || []).join(', ');
+    return `
+      <div class="recon-matched-row group p-3 border-b border-gray-100 hover:bg-green-50 cursor-pointer border-l-4 border-l-green-500 transition-all">
+        <div class="flex justify-between items-start mb-1">
+          <div class="flex items-center gap-2 flex-1 min-w-0">
+            <input type="checkbox" class="recon-checkbox w-3.5 h-3.5 rounded border-gray-300 text-indigo-600 cursor-pointer flex-shrink-0"
+              data-id="${row._id}" data-type="recon_bank"
+              onclick="event.stopPropagation(); updateReconBulkBar()" />
+            <span class="text-xs font-bold text-gray-900 truncate">${row.remitter_name || '-'}</span>
+          </div>
+          <div class="flex items-center gap-1 ml-2 flex-shrink-0">
+            <span class="text-xs font-mono font-bold text-gray-800">AED ${(row.amount||0).toLocaleString()}</span>
+            <button onclick="event.stopPropagation(); deleteRecord('recon_bank','${row._id}')"
+              class="opacity-0 group-hover:opacity-100 p-1 text-red-400 hover:text-red-600 hover:bg-red-50 rounded transition-all" title="Delete">
+              <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg>
+            </button>
+          </div>
+        </div>
+        <div class="flex justify-between items-center">
+          <span class="text-[10px] text-indigo-600 truncate flex-1">${docs || row.matched_customer || '-'}</span>
+          ${_methodBadge(row.match_method)}
+        </div>
+      </div>`;
+  }).join('');
+}
+
+function _buildUnmatchedBankList(rows) {
+  if (!rows.length) return '<p class="p-4 text-xs text-gray-400 italic text-center">All bank rows matched.</p>';
+  return rows.map((r, idx) => `
+    <div class="recon-unbank-row group p-3 border-b border-gray-100 hover:bg-red-50 cursor-pointer border-l-4 border-l-red-400 transition-all">
+      <div class="flex justify-between items-start mb-1">
+        <div class="flex items-center gap-2 flex-1 min-w-0">
+          <input type="checkbox" class="recon-checkbox w-3.5 h-3.5 rounded border-gray-300 text-indigo-600 cursor-pointer flex-shrink-0"
+            data-id="${r._id}" data-type="recon_bank"
+            onclick="event.stopPropagation(); updateReconBulkBar()" />
+          <span class="text-xs font-bold text-gray-900 truncate">${r.remitter_name || '-'}</span>
+        </div>
+        <div class="flex items-center gap-1 ml-2 flex-shrink-0">
+          <span class="text-xs font-mono font-bold text-red-700">AED ${(r.unallocated_amount||0).toLocaleString()}</span>
+          <button onclick="event.stopPropagation(); deleteRecord('recon_bank','${r._id}')"
+            class="opacity-0 group-hover:opacity-100 p-1 text-red-400 hover:text-red-600 hover:bg-red-50 rounded transition-all" title="Delete">
+            <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg>
+          </button>
+        </div>
+      </div>
+      <div class="text-[10px] text-gray-500">${r.txn_date || ''} · ${r.bank_name || ''}</div>
+    </div>`).join('');
+}
+
+function _buildUnmatchedInvList(rows) {
+  if (!rows.length) return '<p class="p-4 text-xs text-gray-400 italic text-center">All invoices cleared.</p>';
+  return rows.map((r, idx) => `
+    <div class="recon-uninv-row group p-3 border-b border-gray-100 hover:bg-amber-50 cursor-pointer border-l-4 border-l-amber-500 transition-all">
+      <div class="flex justify-between items-start mb-1">
+        <div class="flex items-center gap-2 flex-1 min-w-0">
+          <input type="checkbox" class="recon-checkbox w-3.5 h-3.5 rounded border-gray-300 text-indigo-600 cursor-pointer flex-shrink-0"
+            data-id="${r._id}" data-type="recon_invoice"
+            onclick="event.stopPropagation(); updateReconBulkBar()" />
+          <span class="text-xs font-bold text-gray-900 truncate">${r.customer_name || '-'}</span>
+        </div>
+        <div class="flex items-center gap-1 ml-2 flex-shrink-0">
+          <span class="text-xs font-mono font-bold text-amber-700">AED ${(r.remaining_amount||0).toLocaleString()}</span>
+          <button onclick="event.stopPropagation(); deleteRecord('recon_invoice','${r._id}')"
+            class="opacity-0 group-hover:opacity-100 p-1 text-red-400 hover:text-red-600 hover:bg-red-50 rounded transition-all" title="Delete">
+            <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg>
+          </button>
+        </div>
+      </div>
+      <div class="text-[10px] text-gray-500">${r.doc_no || '-'} · ${r.posting_date || ''}</div>
+    </div>`).join('');
+}
+
+function selectMatchedRow(idx, matched) {
+  document.querySelectorAll('.recon-matched-row').forEach(r => r.classList.remove('active'));
+  const rows = document.querySelectorAll('.recon-matched-row');
+  if (rows[idx]) rows[idx].classList.add('active');
+
+  const r = matched[idx];
+  const row = r.bank_row || {};
+  const invoices = r.invoices || [];
+  const pairs = r.pairs || [];
+
+  const invRows = invoices.map(inv => `
+    <tr>
+      <td class="px-3 py-2 text-xs font-medium text-indigo-700">${inv.doc_no || '-'}</td>
+      <td class="px-3 py-2 text-xs text-gray-600">${inv.customer_name || '-'}</td>
+      <td class="px-3 py-2 text-xs font-mono text-gray-600">${inv.posting_date || '-'}</td>
+      <td class="px-3 py-2 text-xs text-right font-mono">${(inv.original_amount||0).toLocaleString()}</td>
+      <td class="px-3 py-2 text-xs text-right font-mono ${inv.cleared_flag ? 'text-green-700 font-bold' : 'text-amber-700'}">${(inv.remaining_amount||0).toLocaleString()}</td>
+      <td class="px-3 py-2 text-xs text-center">${inv.cleared_flag ? '✓' : '~'}</td>
+    </tr>`).join('');
+
+  document.getElementById('detail-panel').innerHTML = `
+    <div class="mb-4 flex items-start justify-between">
+      <div>
+        <h1 class="text-lg font-bold text-gray-900 mb-1">${row.remitter_name || 'Unknown'}</h1>
+        <div class="flex items-center gap-2">
+          <span class="text-xs text-gray-500">${row.txn_date || ''} · ${row.bank_name || ''}</span>
+          ${_methodBadge(row.match_method)}
+        </div>
+      </div>
+      <div class="text-right">
+        <div class="text-2xl font-bold text-gray-900">AED ${(row.amount||0).toLocaleString()}</div>
+        <div class="text-xs text-green-600 font-semibold">Matched: AED ${(row.matched_amount||0).toLocaleString()}</div>
+        ${(row.unallocated_amount||0) > 0.05 ? `<div class="text-xs text-amber-600">Unallocated: AED ${(row.unallocated_amount||0).toLocaleString()}</div>` : ''}
+      </div>
+    </div>
+
+    ${buildMetaGrid([
+      { label: "Matched Customer", value: row.matched_customer || "-" },
+      { label: "Matched Docs", value: (row.matched_doc_nos||[]).join(', ') || "-" },
+      { label: "Match Method", value: row.match_method || "-" },
+      { label: "Value Date", value: row.value_date || "-" },
+    ])}
+
+    <h3 class="text-xs font-bold text-gray-500 uppercase tracking-wider mb-3">Linked Invoices</h3>
+    ${buildTable(
+      [{label:'Doc No'},{label:'Customer'},{label:'Posting Date'},{label:'Original',align:'right'},{label:'Remaining',align:'right'},{label:'Cleared',align:'right'}],
+      invRows || '<tr><td colspan="6" class="px-3 py-4 text-xs text-gray-400 text-center italic">No invoices linked</td></tr>'
+    )}
+
+    <div class="bg-gray-50 border border-gray-200 rounded-lg p-3 mt-4">
+      <h3 class="text-xs font-bold text-gray-500 uppercase tracking-wider mb-2">Raw Description</h3>
+      <p class="text-xs text-gray-700 font-mono leading-relaxed break-all">${row.raw_description || '-'}</p>
+    </div>`;
+}
+
+function selectUnmatchedBank(idx, rows) {
+  document.querySelectorAll('.recon-unbank-row').forEach(r => r.classList.remove('active'));
+  const els = document.querySelectorAll('.recon-unbank-row');
+  if (els[idx]) els[idx].classList.add('active');
+
+  const r = rows[idx];
+  document.getElementById('detail-panel').innerHTML = `
+    <div class="mb-4 flex items-start justify-between">
+      <div>
+        <h1 class="text-lg font-bold text-gray-900 mb-1">${r.remitter_name || 'Unknown'}</h1>
+        <span class="text-xs text-gray-500">${r.txn_date || ''} · ${r.bank_name || ''}</span>
+      </div>
+      <div class="text-right">
+        <div class="text-2xl font-bold text-red-600">AED ${(r.unallocated_amount||0).toLocaleString()}</div>
+        <div class="text-xs text-gray-500">Unallocated</div>
+      </div>
+    </div>
+    ${buildMetaGrid([
+      { label: "Amount", value: `AED ${(r.amount||0).toLocaleString()}` },
+      { label: "Currency", value: r.currency || "AED" },
+      { label: "Candidate Docs", value: (r.candidate_doc_nos||[]).join(', ') || "None found" },
+      { label: "Is Processor", value: r.is_processor ? "Yes" : "No" },
+    ])}
+    <div class="bg-red-50 border border-red-200 rounded-lg p-3 mt-2">
+      <h3 class="text-xs font-bold text-red-700 uppercase tracking-wider mb-2">Needs Manual Review</h3>
+      <p class="text-xs text-gray-700 font-mono leading-relaxed break-all">${r.raw_description || '-'}</p>
+    </div>`;
+}
+
+function selectUnmatchedInv(idx, rows) {
+  document.querySelectorAll('.recon-uninv-row').forEach(r => r.classList.remove('active'));
+  const els = document.querySelectorAll('.recon-uninv-row');
+  if (els[idx]) els[idx].classList.add('active');
+
+  const r = rows[idx];
+  document.getElementById('detail-panel').innerHTML = `
+    <div class="mb-4 flex items-start justify-between">
+      <div>
+        <h1 class="text-lg font-bold text-gray-900 mb-1">${r.customer_name || 'Unknown'}</h1>
+        <span class="text-xs text-gray-500">${r.doc_no || ''} · ${r.posting_date || ''}</span>
+      </div>
+      <div class="text-right">
+        <div class="text-2xl font-bold text-amber-600">AED ${(r.remaining_amount||0).toLocaleString()}</div>
+        <div class="text-xs text-gray-500">Outstanding</div>
+      </div>
+    </div>
+    ${buildMetaGrid([
+      { label: "Document No.", value: r.doc_no || "-" },
+      { label: "Original Amount", value: `AED ${(r.original_amount||0).toLocaleString()}` },
+      { label: "Remaining", value: `AED ${(r.remaining_amount||0).toLocaleString()}` },
+      { label: "LPO", value: r.lpo || "-" },
+    ])}
+    <div class="bg-amber-50 border border-amber-200 rounded-lg p-3 mt-2">
+      <p class="text-xs text-amber-800">This invoice has not been matched to any bank payment. It may be unpaid or paid via a channel not in the current bank statement.</p>
+    </div>`;
+}
+
+// --- Bulk Selection Helpers ---
+
+// Update the "Delete Selected" button visibility for customer_cards / eft_payments
+window.updateBulkBar = (type) => {
+  const suffixMap = { customer_cards: 'cards', eft_payments: 'eft' };
+  const suffix = suffixMap[type];
+  const checked = document.querySelectorAll(`.item-checkbox[data-type="${type}"]:checked`);
+  const btn = document.getElementById(`bulk-delete-${suffix}`);
+  const countEl = document.getElementById(`selected-count-${suffix}`);
+  if (!btn) return;
+  if (checked.length > 0) {
+    btn.classList.remove('hidden');
+    btn.classList.add('inline-flex');
+  } else {
+    btn.classList.add('hidden');
+    btn.classList.remove('inline-flex');
+  }
+  if (countEl) countEl.textContent = checked.length;
+};
+
+window.toggleSelectAll = (type, checked) => {
+  document.querySelectorAll(`.item-checkbox[data-type="${type}"]`).forEach(cb => cb.checked = checked);
+  updateBulkBar(type);
+};
+
+window.deleteSelected = async (type) => {
+  const checked = [...document.querySelectorAll(`.item-checkbox[data-type="${type}"]:checked`)];
+  if (!checked.length) return;
+  if (!confirm(`Delete ${checked.length} selected record(s)? This cannot be undone.`)) return;
+  let failed = 0;
+  for (const cb of checked) {
+    try {
+      const res = await fetch(`/api/${type}/${cb.dataset.id}`, { method: 'DELETE' });
+      if (!res.ok) failed++;
+    } catch { failed++; }
+  }
+  showToast(failed ? `Deleted with ${failed} error(s)` : `Deleted ${checked.length} record(s)`, failed ? 'error' : 'success');
+  const activeNav = document.querySelector('.nav-item.active');
+  if (activeNav) triggerNav(activeNav.id.replace('nav-', ''));
+};
+
+// Recon tab bulk helpers
+window.updateReconBulkBar = () => {
+  const checked = document.querySelectorAll('.recon-checkbox:checked');
+  const btn = document.getElementById('bulk-delete-recon');
+  const countEl = document.getElementById('selected-count-recon');
+  if (!btn) return;
+  if (checked.length > 0) {
+    btn.classList.remove('hidden');
+    btn.classList.add('inline-flex');
+  } else {
+    btn.classList.add('hidden');
+    btn.classList.remove('inline-flex');
+  }
+  if (countEl) countEl.textContent = checked.length;
+};
+
+window.toggleSelectAllRecon = (checked) => {
+  document.querySelectorAll('.recon-checkbox').forEach(cb => cb.checked = checked);
+  updateReconBulkBar();
+};
+
+window.deleteSelectedRecon = async () => {
+  const checked = [...document.querySelectorAll('.recon-checkbox:checked')];
+  if (!checked.length) return;
+  if (!confirm(`Delete ${checked.length} selected record(s)? This cannot be undone.`)) return;
+  let failed = 0;
+  for (const cb of checked) {
+    const urlMap = { recon_bank: `/api/recon/bank/${cb.dataset.id}`, recon_invoice: `/api/recon/invoice/${cb.dataset.id}` };
+    try {
+      const res = await fetch(urlMap[cb.dataset.type], { method: 'DELETE' });
+      if (!res.ok) failed++;
+    } catch { failed++; }
+  }
+  showToast(failed ? `Deleted with ${failed} error(s)` : `Deleted ${checked.length} record(s)`, failed ? 'error' : 'success');
+  renderDhofarReconciliation();
+};
+
+// --- Delete Record Handler ---
+window.deleteRecord = async (type, id) => {
+  const labels = {
+    customer_cards: 'customer card',
+    eft_payments: 'EFT payment',
+    recon_bank: 'bank transaction',
+    recon_invoice: 'open invoice',
+  };
+  if (!confirm(`Delete this ${labels[type] || 'record'}? This cannot be undone.`)) return;
+
+  const urlMap = {
+    customer_cards: `/api/customer_cards/${id}`,
+    eft_payments: `/api/eft_payments/${id}`,
+    recon_bank: `/api/recon/bank/${id}`,
+    recon_invoice: `/api/recon/invoice/${id}`,
+  };
+
+  try {
+    const res = await fetch(urlMap[type], { method: 'DELETE' });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    showToast(`Deleted successfully`, 'success');
+    // Refresh the current view
+    const activeNav = document.querySelector('.nav-item.active');
+    if (activeNav) triggerNav(activeNav.id.replace('nav-', ''));
+  } catch (e) {
+    showToast(`Delete failed: ${e.message}`, 'error');
+  }
+};
+
+window.triggerDhofarRecon = async () => {
+  showToast('Running reconciliation engine...', 'success');
+  try {
+    const res = await fetch('/api/dhofar/reconcile', { method: 'POST' });
+    const data = await res.json();
+    if (data.success) {
+      const s = data.summary;
+      showToast(`Done: ${s.bank_rows_matched} bank matched, ${s.invoices_cleared} invoices cleared`, 'success');
+      renderDhofarReconciliation();
+    } else {
+      showToast('Failed: ' + (data.detail || 'unknown error'), 'error');
+    }
+  } catch (e) {
+    showToast('Error: ' + e.message, 'error');
+  }
+};
+
+function filterDhofarRecon(term) {
+  if (!window.dhofarReconData) return;
+  const data = window.dhofarReconData;
+  if (!term) { renderDhofarReconTabs(data.matched||[], data.unmatched_bank||[], data.unmatched_invoices||[]); return; }
+  const t = term.toLowerCase();
+  const matched   = (data.matched||[]).filter(r => {
+    const row = r.bank_row || {};
+    return (row.remitter_name||'').toLowerCase().includes(t) ||
+           (row.matched_customer||'').toLowerCase().includes(t) ||
+           (row.matched_doc_nos||[]).join(' ').toLowerCase().includes(t);
+  });
+  const unmatchedB = (data.unmatched_bank||[]).filter(r =>
+    (r.remitter_name||'').toLowerCase().includes(t) || (r.raw_description||'').toLowerCase().includes(t));
+  const unmatchedI = (data.unmatched_invoices||[]).filter(r =>
+    (r.customer_name||'').toLowerCase().includes(t) || (r.doc_no||'').toLowerCase().includes(t));
+  renderDhofarReconTabs(matched, unmatchedB, unmatchedI);
+}
+
 
 function renderDhofarReconList(data) {
   const statusStyles = {
@@ -3279,7 +3779,7 @@ function renderDhofarReconSummary(data) {
   const matched   = data.filter(d => d.status === 'matched');
   const partial   = data.filter(d => d.status === 'partial');
   const unmatched = data.filter(d => d.status === 'unmatched');
-  const total     = data.reduce((s, d) => s + (d.amount || 0), 0);
+  const totalEft   = data.reduce((s, d) => s + (d.total_amount ?? d.amount ?? 0), 0);
   const matchedAmt = matched.reduce((s, d) => s + (d.amount || 0), 0);
   const partialAmt = partial.reduce((s, d) => s + (d.amount || 0), 0);
 
@@ -3303,7 +3803,7 @@ function renderDhofarReconSummary(data) {
         </div>
         <div class="h-10 w-px bg-gray-300"></div>
         <div class="text-center">
-          <div class="text-xl font-bold text-indigo-600">${Math.round(matched.length / data.length * 100)}%</div>
+          <div class="text-xl font-bold text-indigo-600">${data.length > 0 ? Math.round(matched.length / data.length * 100) : 0}%</div>
           <div class="text-[7.5px] text-gray-500 uppercase font-semibold mt-1">Match Rate</div>
         </div>
       </div>
@@ -3317,7 +3817,7 @@ function renderDhofarReconSummary(data) {
           <div class="text-[8px] text-amber-100 uppercase font-bold mt-0.5">Partial</div>
         </div>
         <div class="text-center px-3 py-2 bg-gradient-to-br from-blue-500 to-blue-600 rounded-lg shadow-sm min-w-[100px]">
-          <div class="text-sm font-bold text-white">AED ${total.toLocaleString()}</div>
+          <div class="text-sm font-bold text-white">AED ${totalEft.toLocaleString()}</div>
           <div class="text-[8px] text-blue-100 uppercase font-bold mt-0.5">Total EFT</div>
         </div>
         <button onclick="triggerDhofarRecon()" class="px-3 py-2 bg-amber-600 hover:bg-amber-700 text-white rounded-lg text-xs font-semibold transition-all shadow-sm">
@@ -3335,7 +3835,7 @@ window.triggerDhofarRecon = async () => {
     const data = await res.json();
     if (data.success) {
       const s = data.summary;
-      showToast(`Done: ${s.matched} matched, ${s.partial} partial, ${s.unmatched} unmatched`, 'success');
+      showToast(`Done: ${s.bank_rows_matched} bank matched, ${s.invoices_cleared} invoices cleared`, 'success');
       renderDhofarReconciliation();
     } else {
       showToast('Reconciliation failed: ' + (data.detail || 'unknown error'), 'error');
